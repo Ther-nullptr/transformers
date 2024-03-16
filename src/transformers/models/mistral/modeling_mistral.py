@@ -70,6 +70,23 @@ def _get_unpad_data(attention_mask):
     )
 
 
+# packaged hadamard
+class MistralHadamard(nn.Module):
+    def __init__(self):
+        super.__init__()
+
+    def forward(x1, x2):
+        return x1 * x2
+    
+
+class MistralGEMM(nn.Module):
+    def __init__(self):
+        super.__init__()
+
+    def forward(x1, x2):
+        return x1 @ x2
+
+
 # Copied from transformers.models.llama.modeling_llama.LlamaRMSNorm with Llama->Mistral
 class MistralRMSNorm(nn.Module):
     def __init__(self, hidden_size, eps=1e-6):
@@ -171,10 +188,11 @@ class MistralMLP(nn.Module):
         self.gate_proj = nn.Linear(self.hidden_size, self.intermediate_size, bias=False)
         self.up_proj = nn.Linear(self.hidden_size, self.intermediate_size, bias=False)
         self.down_proj = nn.Linear(self.intermediate_size, self.hidden_size, bias=False)
+        self.hadamard = MistralHadamard()
         self.act_fn = ACT2FN[config.hidden_act]
 
     def forward(self, x):
-        return self.down_proj(self.act_fn(self.gate_proj(x)) * self.up_proj(x))
+        return self.down_proj(self.hadamard(self.act_fn(self.gate_proj(x)), self.up_proj(x)))
 
 
 # Copied from transformers.models.llama.modeling_llama.repeat_kv
@@ -232,6 +250,8 @@ class MistralAttention(nn.Module):
             max_position_embeddings=self.max_position_embeddings,
             base=self.rope_theta,
         )
+        self.gemm = MistralGEMM()
+        self.softmax = nn.Softmax(dim=-1)
 
     def _shape(self, tensor: torch.Tensor, seq_len: int, bsz: int):
         return tensor.view(bsz, seq_len, self.num_heads, self.head_dim).transpose(1, 2).contiguous()
@@ -280,7 +300,7 @@ class MistralAttention(nn.Module):
         key_states = repeat_kv(key_states, self.num_key_value_groups)
         value_states = repeat_kv(value_states, self.num_key_value_groups)
 
-        attn_weights = torch.matmul(query_states, key_states.transpose(2, 3)) / math.sqrt(self.head_dim)
+        attn_weights = self.gemm(query_states, key_states.transpose(2, 3)) / math.sqrt(self.head_dim)
 
         if attn_weights.size() != (bsz, self.num_heads, q_len, kv_seq_len):
             raise ValueError(
@@ -297,7 +317,8 @@ class MistralAttention(nn.Module):
             attn_weights = attn_weights + attention_mask
 
         # upcast attention to fp32
-        attn_weights = nn.functional.softmax(attn_weights, dim=-1, dtype=torch.float32).to(query_states.dtype)
+        # attn_weights = nn.functional.softmax(attn_weights, dim=-1, dtype=torch.float32).to(query_states.dtype)
+        attn_weights = self.softmax(attn_weights).to(query_states.dtype)
         attn_weights = nn.functional.dropout(attn_weights, p=self.attention_dropout, training=self.training)
         attn_output = torch.matmul(attn_weights, value_states)
 
@@ -876,7 +897,8 @@ class MistralModel(MistralPreTrainedModel):
             inputs_embeds = self.embed_tokens(input_ids)
 
         if attention_mask is not None and self._use_flash_attention_2 and use_cache:
-            is_padding_right = attention_mask[:, -1].sum().item() != batch_size
+            # is_padding_right = attention_mask[:, -1].sum().item() != batch_size
+            is_padding_right = False
             if is_padding_right:
                 raise ValueError(
                     "You are attempting to perform batched generation with padding_side='right'"
