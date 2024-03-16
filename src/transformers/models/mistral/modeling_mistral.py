@@ -73,7 +73,7 @@ def _get_unpad_data(attention_mask):
 # packaged hadamard
 class MistralHadamard(nn.Module):
     def __init__(self):
-        super.__init__()
+        super().__init__()
 
     def forward(x1, x2):
         return x1 * x2
@@ -81,7 +81,7 @@ class MistralHadamard(nn.Module):
 
 class MistralGEMM(nn.Module):
     def __init__(self):
-        super.__init__()
+        super().__init__()
 
     def forward(x1, x2):
         return x1 @ x2
@@ -250,7 +250,8 @@ class MistralAttention(nn.Module):
             max_position_embeddings=self.max_position_embeddings,
             base=self.rope_theta,
         )
-        self.gemm = MistralGEMM()
+        self.gemm1 = MistralGEMM()
+        self.gemm2 = MistralGEMM()
         self.softmax = nn.Softmax(dim=-1)
 
     def _shape(self, tensor: torch.Tensor, seq_len: int, bsz: int):
@@ -300,7 +301,7 @@ class MistralAttention(nn.Module):
         key_states = repeat_kv(key_states, self.num_key_value_groups)
         value_states = repeat_kv(value_states, self.num_key_value_groups)
 
-        attn_weights = self.gemm(query_states, key_states.transpose(2, 3)) / math.sqrt(self.head_dim)
+        attn_weights = self.gemm1(query_states, key_states.transpose(2, 3)) / math.sqrt(self.head_dim)
 
         if attn_weights.size() != (bsz, self.num_heads, q_len, kv_seq_len):
             raise ValueError(
@@ -320,7 +321,7 @@ class MistralAttention(nn.Module):
         # attn_weights = nn.functional.softmax(attn_weights, dim=-1, dtype=torch.float32).to(query_states.dtype)
         attn_weights = self.softmax(attn_weights).to(query_states.dtype)
         attn_weights = nn.functional.dropout(attn_weights, p=self.attention_dropout, training=self.training)
-        attn_output = torch.matmul(attn_weights, value_states)
+        attn_output = self.gemm2(attn_weights, value_states)
 
         if attn_output.size() != (bsz, self.num_heads, q_len, self.head_dim):
             raise ValueError(
