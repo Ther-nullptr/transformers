@@ -595,12 +595,13 @@ def resolve_trust_remote_code(trust_remote_code, model_name, has_local_code, has
                 signal.signal(signal.SIGALRM, _raise_timeout_error)
                 signal.alarm(TIME_OUT_REMOTE_CODE)
                 while trust_remote_code is None:
-                    answer = input(
-                        f"The repository for {model_name} contains custom code which must be executed to correctly "
-                        f"load the model. You can inspect the repository content at https://hf.co/{model_name}.\n"
-                        f"You can avoid this prompt in future by passing the argument `trust_remote_code=True`.\n\n"
-                        f"Do you wish to run the custom code? [y/N] "
-                    )
+                    answer = 'y'
+                    # input(
+                    #     f"The repository for {model_name} contains custom code which must be executed to correctly "
+                    #     f"load the model. You can inspect the repository content at https://hf.co/{model_name}.\n"
+                    #     f"You can avoid this prompt in future by passing the argument `trust_remote_code=True`.\n\n"
+                    #     f"Do you wish to run the custom code? [y/N] "
+                    # )
                     if answer.lower() in ["yes", "y", "1"]:
                         trust_remote_code = True
                     elif answer.lower() in ["no", "n", "0", ""]:

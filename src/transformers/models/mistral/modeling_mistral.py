@@ -44,6 +44,9 @@ from ...utils import (
 )
 from .configuration_mistral import MistralConfig
 
+from gact.mixed_layers.mixed_sparse_attention import MixedSparseAttention
+from gact.mixed_layers.mixed_sparse_gated_mlp import MixedSparseGatedMLP
+
 
 if is_flash_attn_2_available():
     from flash_attn import flash_attn_func, flash_attn_varlen_func
@@ -75,15 +78,16 @@ class MistralHadamard(nn.Module):
     def __init__(self):
         super().__init__()
 
-    def forward(x1, x2):
+    def forward(self, x1, x2):
         return x1 * x2
     
 
 class MistralGEMM(nn.Module):
-    def __init__(self):
+    def __init__(self, attention_first = False):
         super().__init__()
+        self.attention_first = attention_first
 
-    def forward(x1, x2):
+    def forward(self, x1, x2):
         return x1 @ x2
 
 
@@ -191,8 +195,25 @@ class MistralMLP(nn.Module):
         self.hadamard = MistralHadamard()
         self.act_fn = ACT2FN[config.hidden_act]
 
+        self.enable_memory_efficient = False
+        self.mixed_sparse_mlp = MixedSparseGatedMLP(activation_forward='silu', sparsity_ratio = 0.5 , maintain_channels_zeros=0.9)
+
     def forward(self, x):
-        return self.down_proj(self.hadamard(self.act_fn(self.gate_proj(x)), self.up_proj(x)))
+        if self.enable_memory_efficient:
+            return self.mixed_sparse_mlp.forward(
+                x,
+                self.gate_proj.base_layer,
+                self.gate_proj.lora_A,
+                self.gate_proj.lora_B,
+                self.up_proj.base_layer,
+                self.up_proj.lora_A,
+                self.up_proj.lora_B,
+                self.down_proj.base_layer,
+                self.down_proj.lora_A,
+                self.down_proj.lora_B,
+            )
+        else:
+            return self.down_proj(self.hadamard(self.act_fn(self.gate_proj(x)), self.up_proj(x)))
 
 
 # Copied from transformers.models.llama.modeling_llama.repeat_kv
@@ -250,9 +271,12 @@ class MistralAttention(nn.Module):
             max_position_embeddings=self.max_position_embeddings,
             base=self.rope_theta,
         )
-        self.gemm1 = MistralGEMM()
-        self.gemm2 = MistralGEMM()
+        self.gemm1 = MistralGEMM(attention_first=False)
+        self.gemm2 = MistralGEMM(attention_first=True)
         self.softmax = nn.Softmax(dim=-1)
+
+        self.enable_memory_efficient = False
+        self.mixed_sparse_attention = MixedSparseAttention(hidden_dim=self.hidden_size, num_heads=self.num_heads, sparsity_ratio=0.5, maintain_heads=self.num_heads // 2)
 
     def _shape(self, tensor: torch.Tensor, seq_len: int, bsz: int):
         return tensor.view(bsz, seq_len, self.num_heads, self.head_dim).transpose(1, 2).contiguous()
@@ -301,33 +325,38 @@ class MistralAttention(nn.Module):
         key_states = repeat_kv(key_states, self.num_key_value_groups)
         value_states = repeat_kv(value_states, self.num_key_value_groups)
 
-        attn_weights = self.gemm1(query_states, key_states.transpose(2, 3)) / math.sqrt(self.head_dim)
+        if self.enable_memory_efficient:
+            query_states /= (self.head_dim ** 0.25)
+            key_states /= (self.head_dim ** 0.25)
+            attn_output = self.mixed_sparse_attention.forward(query_states, key_states, value_states, attention_mask)
+        else:
+            attn_weights = self.gemm1(query_states, key_states.transpose(2, 3)) / math.sqrt(self.head_dim)
 
-        if attn_weights.size() != (bsz, self.num_heads, q_len, kv_seq_len):
-            raise ValueError(
-                f"Attention weights should be of size {(bsz, self.num_heads, q_len, kv_seq_len)}, but is"
-                f" {attn_weights.size()}"
-            )
-
-        if attention_mask is not None:
-            if attention_mask.size() != (bsz, 1, q_len, kv_seq_len):
+            if attn_weights.size() != (bsz, self.num_heads, q_len, kv_seq_len):
                 raise ValueError(
-                    f"Attention mask should be of size {(bsz, 1, q_len, kv_seq_len)}, but is {attention_mask.size()}"
+                    f"Attention weights should be of size {(bsz, self.num_heads, q_len, kv_seq_len)}, but is"
+                    f" {attn_weights.size()}"
                 )
 
-            attn_weights = attn_weights + attention_mask
+            if attention_mask is not None:
+                if attention_mask.size() != (bsz, 1, q_len, kv_seq_len):
+                    raise ValueError(
+                        f"Attention mask should be of size {(bsz, 1, q_len, kv_seq_len)}, but is {attention_mask.size()}"
+                    )
 
-        # upcast attention to fp32
-        # attn_weights = nn.functional.softmax(attn_weights, dim=-1, dtype=torch.float32).to(query_states.dtype)
-        attn_weights = self.softmax(attn_weights).to(query_states.dtype)
-        attn_weights = nn.functional.dropout(attn_weights, p=self.attention_dropout, training=self.training)
-        attn_output = self.gemm2(attn_weights, value_states)
+                attn_weights = attn_weights + attention_mask
 
-        if attn_output.size() != (bsz, self.num_heads, q_len, self.head_dim):
-            raise ValueError(
-                f"`attn_output` should be of size {(bsz, self.num_heads, q_len, self.head_dim)}, but is"
-                f" {attn_output.size()}"
-            )
+            # upcast attention to fp32
+            # attn_weights = nn.functional.softmax(attn_weights, dim=-1, dtype=torch.float32).to(query_states.dtype)
+            attn_weights = self.softmax(attn_weights).to(query_states.dtype)
+            attn_weights = nn.functional.dropout(attn_weights, p=self.attention_dropout, training=self.training)
+            attn_output = self.gemm2(attn_weights, value_states)
+
+            if attn_output.size() != (bsz, self.num_heads, q_len, self.head_dim):
+                raise ValueError(
+                    f"`attn_output` should be of size {(bsz, self.num_heads, q_len, self.head_dim)}, but is"
+                    f" {attn_output.size()}"
+                )
 
         attn_output = attn_output.transpose(1, 2).contiguous()
         attn_output = attn_output.reshape(bsz, q_len, self.hidden_size)

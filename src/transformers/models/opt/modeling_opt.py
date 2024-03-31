@@ -41,6 +41,8 @@ from ...utils import (
 )
 from .configuration_opt import OPTConfig
 
+from gact.mixed_layers.mixed_sparse_attention import MixedSparseAttention
+from gact.mixed_layers.mixed_sparse_traditional_mlp import MixedSparseTraditionalMLP
 
 if is_flash_attn_2_available():
     from flash_attn import flash_attn_func, flash_attn_varlen_func
@@ -83,6 +85,14 @@ def _get_unpad_data(attention_mask):
         cu_seqlens,
         max_seqlen_in_batch,
     )
+
+
+class OPTGEMM(nn.Module):
+    def __init__(self):
+        super().__init__()
+
+    def forward(self, x1, x2):
+        return x1 @ x2
 
 
 class OPTLearnedPositionalEmbedding(nn.Embedding):
@@ -157,6 +167,16 @@ class OPTAttention(nn.Module):
         self.v_proj = nn.Linear(self.embed_dim, self.embed_dim, bias=self.enable_bias)
         self.q_proj = nn.Linear(self.embed_dim, self.embed_dim, bias=self.enable_bias)
         self.out_proj = nn.Linear(self.embed_dim, self.embed_dim, bias=self.enable_bias)
+        self.gemm1 = OPTGEMM()
+        self.gemm2 = OPTGEMM()
+        self.softmax = nn.Softmax(dim=-1)
+
+        self.sparsity_ratio = None
+        self.maintain_heads = None
+
+        # whether to enable memory dropping version of attn
+        self.enable_memory_efficient = False
+        self.mixed_sparse_attention = MixedSparseAttention(hidden_dim=self.embed_dim, num_heads=self.num_heads)
 
     def _shape(self, tensor: torch.Tensor, seq_len: int, bsz: int):
         return tensor.view(bsz, seq_len, self.num_heads, self.head_dim).transpose(1, 2).contiguous()
@@ -216,53 +236,70 @@ class OPTAttention(nn.Module):
         value_states = value_states.view(*proj_shape)
 
         src_len = key_states.size(1)
-        attn_weights = torch.bmm(query_states, key_states.transpose(1, 2))
 
-        if attn_weights.size() != (bsz * self.num_heads, tgt_len, src_len):
-            raise ValueError(
-                f"Attention weights should be of size {(bsz * self.num_heads, tgt_len, src_len)}, but is"
-                f" {attn_weights.size()}"
+        if self.enable_memory_efficient:
+            new_proj_shape = (bsz, self.num_heads, -1, self.head_dim)
+            query_states = query_states.view(*new_proj_shape)
+            key_states = key_states.view(*new_proj_shape)
+            value_states = value_states.view(*new_proj_shape)
+            attn_output = self.mixed_sparse_attention.forward(
+                query_states, 
+                key_states, 
+                value_states, 
+                attention_mask,
+                self.sparsity_ratio,
+                self.maintain_heads
             )
-
-        if attention_mask is not None:
-            if attention_mask.size() != (bsz, 1, tgt_len, src_len):
-                raise ValueError(
-                    f"Attention mask should be of size {(bsz, 1, tgt_len, src_len)}, but is {attention_mask.size()}"
-                )
-            attn_weights = attn_weights.view(bsz, self.num_heads, tgt_len, src_len) + attention_mask
-            attn_weights = torch.max(
-                attn_weights, torch.tensor(torch.finfo(attn_weights.dtype).min, device=attn_weights.device)
-            )
-            attn_weights = attn_weights.view(bsz * self.num_heads, tgt_len, src_len)
-
-        # upcast to fp32 if the weights are in fp16. Please see https://github.com/huggingface/transformers/pull/17437
-        if attn_weights.dtype == torch.float16:
-            attn_weights = nn.functional.softmax(attn_weights, dim=-1, dtype=torch.float32).to(torch.float16)
-        else:
-            attn_weights = nn.functional.softmax(attn_weights, dim=-1)
-
-        if layer_head_mask is not None:
-            if layer_head_mask.size() != (self.num_heads,):
-                raise ValueError(
-                    f"Head mask for a single layer should be of size {(self.num_heads,)}, but is"
-                    f" {layer_head_mask.size()}"
-                )
-            attn_weights = layer_head_mask.view(1, -1, 1, 1) * attn_weights.view(bsz, self.num_heads, tgt_len, src_len)
-            attn_weights = attn_weights.view(bsz * self.num_heads, tgt_len, src_len)
-
-        if output_attentions:
-            # this operation is a bit awkward, but it's required to
-            # make sure that attn_weights keeps its gradient.
-            # In order to do so, attn_weights have to be reshaped
-            # twice and have to be reused in the following
-            attn_weights_reshaped = attn_weights.view(bsz, self.num_heads, tgt_len, src_len)
-            attn_weights = attn_weights_reshaped.view(bsz * self.num_heads, tgt_len, src_len)
-        else:
+            attn_output = attn_output.view(*proj_shape)
             attn_weights_reshaped = None
+        else:
+            attn_weights = self.gemm1(query_states, key_states.transpose(1, 2))
 
-        attn_probs = nn.functional.dropout(attn_weights, p=self.dropout, training=self.training)
+            if attn_weights.size() != (bsz * self.num_heads, tgt_len, src_len):
+                raise ValueError(
+                    f"Attention weights should be of size {(bsz * self.num_heads, tgt_len, src_len)}, but is"
+                    f" {attn_weights.size()}"
+                )
 
-        attn_output = torch.bmm(attn_probs, value_states)
+            if attention_mask is not None:
+                if attention_mask.size() != (bsz, 1, tgt_len, src_len):
+                    raise ValueError(
+                        f"Attention mask should be of size {(bsz, 1, tgt_len, src_len)}, but is {attention_mask.size()}"
+                    )
+                attn_weights = attn_weights.view(bsz, self.num_heads, tgt_len, src_len) + attention_mask
+                attn_weights = torch.max(
+                    attn_weights, torch.tensor(torch.finfo(attn_weights.dtype).min, device=attn_weights.device)
+                )
+                attn_weights = attn_weights.view(bsz * self.num_heads, tgt_len, src_len)
+
+            # upcast to fp32 if the weights are in fp16. Please see https://github.com/huggingface/transformers/pull/17437
+            if attn_weights.dtype == torch.float16:
+                attn_weights = self.softmax(attn_weights).to(torch.float16)
+            else:
+                attn_weights = self.softmax(attn_weights)
+
+            if layer_head_mask is not None:
+                if layer_head_mask.size() != (self.num_heads,):
+                    raise ValueError(
+                        f"Head mask for a single layer should be of size {(self.num_heads,)}, but is"
+                        f" {layer_head_mask.size()}"
+                    )
+                attn_weights = layer_head_mask.view(1, -1, 1, 1) * attn_weights.view(bsz, self.num_heads, tgt_len, src_len)
+                attn_weights = attn_weights.view(bsz * self.num_heads, tgt_len, src_len)
+
+            if output_attentions:
+                # this operation is a bit awkward, but it's required to
+                # make sure that attn_weights keeps its gradient.
+                # In order to do so, attn_weights have to be reshaped
+                # twice and have to be reused in the following
+                attn_weights_reshaped = attn_weights.view(bsz, self.num_heads, tgt_len, src_len)
+                attn_weights = attn_weights_reshaped.view(bsz * self.num_heads, tgt_len, src_len)
+            else:
+                attn_weights_reshaped = None
+
+            attn_probs = nn.functional.dropout(attn_weights, p=self.dropout, training=self.training)
+
+            attn_output = self.gemm2(attn_probs, value_states)
 
         if attn_output.size() != (bsz * self.num_heads, tgt_len, self.head_dim):
             raise ValueError(
@@ -515,6 +552,9 @@ class OPTDecoderLayer(nn.Module):
         self.fc2 = nn.Linear(config.ffn_dim, self.embed_dim, bias=config.enable_bias)
         self.final_layer_norm = nn.LayerNorm(self.embed_dim, elementwise_affine=config.layer_norm_elementwise_affine)
 
+        self.enable_memory_efficient = False
+        self.mixed_sparse_mlp = MixedSparseTraditionalMLP(quantization=False)
+
     def forward(
         self,
         hidden_states: torch.Tensor,
@@ -566,19 +606,33 @@ class OPTDecoderLayer(nn.Module):
         hidden_states = hidden_states.reshape(-1, hidden_states.size(-1))
         residual = hidden_states
 
-        # 125m, 1.7B, ..., 175B applies layer norm BEFORE attention
+        # 125m, 1.7B, ..., 175B applies layer norm BEFORE fc
         if self.do_layer_norm_before:
             hidden_states = self.final_layer_norm(hidden_states)
 
-        hidden_states = self.fc1(hidden_states)
-        hidden_states = self.activation_fn(hidden_states)
+        if self.enable_memory_efficient:
+            # convert the hidden state to original shape
+            hidden_states = hidden_states.view(hidden_states_shape)
+            hidden_states = self.mixed_sparse_mlp(
+                hidden_states,
+                self.fc1.base_layer,
+                self.fc1.lora_A,
+                self.fc1.lora_B,
+                self.fc2.base_layer,
+                self.fc2.lora_A,
+                self.fc2.lora_B,
+            )
+            hidden_states = hidden_states.view(-1, hidden_states.size(-1))
+        else:
+            hidden_states = self.fc1(hidden_states)
+            hidden_states = self.activation_fn(hidden_states)
 
-        hidden_states = self.fc2(hidden_states)
-        hidden_states = nn.functional.dropout(hidden_states, p=self.dropout, training=self.training)
+            hidden_states = self.fc2(hidden_states)
+            hidden_states = nn.functional.dropout(hidden_states, p=self.dropout, training=self.training)
 
         hidden_states = (residual + hidden_states).view(hidden_states_shape)
 
-        # 350m applies layer norm AFTER attention
+        # 350m applies layer norm AFTER fc
         if not self.do_layer_norm_before:
             hidden_states = self.final_layer_norm(hidden_states)
 

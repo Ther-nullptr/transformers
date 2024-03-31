@@ -756,6 +756,7 @@ _import_structure = {
     "models.segformer": ["SEGFORMER_PRETRAINED_CONFIG_ARCHIVE_MAP", "SegformerConfig"],
     "models.sew": ["SEW_PRETRAINED_CONFIG_ARCHIVE_MAP", "SEWConfig"],
     "models.sew_d": ["SEW_D_PRETRAINED_CONFIG_ARCHIVE_MAP", "SEWDConfig"],
+    "models.sparsellama": ["LLAMA_PRETRAINED_CONFIG_ARCHIVE_MAP", "SparseLlamaConfig"],
     "models.speech_encoder_decoder": ["SpeechEncoderDecoderConfig"],
     "models.speech_to_text": [
         "SPEECH_TO_TEXT_PRETRAINED_CONFIG_ARCHIVE_MAP",
@@ -3136,6 +3137,17 @@ else:
             "SEWDPreTrainedModel",
         ]
     )
+    _import_structure["models.sparsellama"].extend(
+        [
+            "SparseLlamaGEMM",
+            "SparseLlamaHadamard",
+            "SparseLlamaMLP",
+            "SparseLlamaPreTrainedModel",
+            "SparseLlamaModel",
+            "SparseLlamaForCausalLM",
+            "SparseLlamaForSequenceClassification"
+        ]
+    )
     _import_structure["models.speech_encoder_decoder"].extend(["SpeechEncoderDecoderModel"])
     _import_structure["models.speech_to_text"].extend(
         [
@@ -5409,6 +5421,7 @@ if TYPE_CHECKING:
     )
     from .models.sew import SEW_PRETRAINED_CONFIG_ARCHIVE_MAP, SEWConfig
     from .models.sew_d import SEW_D_PRETRAINED_CONFIG_ARCHIVE_MAP, SEWDConfig
+    from .models.sparsellama import LLAMA_PRETRAINED_CONFIG_ARCHIVE_MAP, SparseLlamaConfig
     from .models.speech_encoder_decoder import SpeechEncoderDecoderConfig
     from .models.speech_to_text import (
         SPEECH_TO_TEXT_PRETRAINED_CONFIG_ARCHIVE_MAP,
@@ -7464,6 +7477,15 @@ if TYPE_CHECKING:
             SEWDForSequenceClassification,
             SEWDModel,
             SEWDPreTrainedModel,
+        )
+        from .models.sparsellama import (
+            SparseLlamaGEMM,
+            SparseLlamaHadamard,
+            SparseLlamaMLP,
+            SparseLlamaPreTrainedModel,
+            SparseLlamaModel,
+            SparseLlamaForCausalLM,
+            SparseLlamaForSequenceClassification
         )
         from .models.speech_encoder_decoder import SpeechEncoderDecoderModel
         from .models.speech_to_text import (
