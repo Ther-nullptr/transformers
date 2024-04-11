@@ -45,6 +45,7 @@ from ...utils import (
 )
 from .configuration_roberta import RobertaConfig
 
+from gact.mixed_layers.mixed_sparse_full_attention import MixedSparseFullAttention
 
 logger = logging.get_logger(__name__)
 
@@ -226,7 +227,7 @@ class RobertaSelfAttention(nn.Module):
             value_layer = self.transpose_for_scores(self.value(hidden_states))
             key_layer = torch.cat([past_key_value[0], key_layer], dim=2)
             value_layer = torch.cat([past_key_value[1], value_layer], dim=2)
-        else:
+        else: #! the default path
             key_layer = self.transpose_for_scores(self.key(hidden_states))
             value_layer = self.transpose_for_scores(self.value(hidden_states))
 
@@ -246,6 +247,7 @@ class RobertaSelfAttention(nn.Module):
         # Take the dot product between "query" and "key" to get the raw attention scores.
         attention_scores = self.gemm1(query_layer, key_layer.transpose(-1, -2))
 
+        #! this path is disabled
         if self.position_embedding_type == "relative_key" or self.position_embedding_type == "relative_key_query":
             query_length, key_length = query_layer.shape[2], key_layer.shape[2]
             if use_cache:
@@ -281,6 +283,7 @@ class RobertaSelfAttention(nn.Module):
         attention_probs = self.dropout(attention_probs)
 
         # Mask heads if we want to
+        #! this path is disabled
         if head_mask is not None:
             attention_probs = attention_probs * head_mask
 
@@ -319,6 +322,12 @@ class RobertaAttention(nn.Module):
         self.self = RobertaSelfAttention(config, position_embedding_type=position_embedding_type)
         self.output = RobertaSelfOutput(config)
         self.pruned_heads = set()
+                
+        self.mixed_sparse_full_attention = MixedSparseFullAttention(
+            hidden_dim=config.hidden_size,
+            num_heads=self.self.num_attention_heads,
+        )
+        self.use_mixed_operation = True
 
     def prune_heads(self, heads):
         if len(heads) == 0:
@@ -348,17 +357,43 @@ class RobertaAttention(nn.Module):
         past_key_value: Optional[Tuple[Tuple[torch.FloatTensor]]] = None,
         output_attentions: Optional[bool] = False,
     ) -> Tuple[torch.Tensor]:
-        self_outputs = self.self(
-            hidden_states,
-            attention_mask,
-            head_mask,
-            encoder_hidden_states,
-            encoder_attention_mask,
-            past_key_value,
-            output_attentions,
-        )
-        attention_output = self.output(self_outputs[0], hidden_states)
-        outputs = (attention_output,) + self_outputs[1:]  # add attentions if we output them
+        
+        if self.use_mixed_operation:
+            outputs = self.mixed_sparse_full_attention.forward(
+                hidden_states,
+                self.self.query.base_layer,
+                self.self.query.lora_A,
+                self.self.query.lora_B,
+                self.self.key.base_layer,
+                self.self.key.lora_A,
+                self.self.key.lora_B,
+                self.self.value.base_layer,
+                self.self.value.lora_A,
+                self.self.value.lora_B,
+                self.output.dense.base_layer,
+                self.output.dense.lora_A,
+                self.output.dense.lora_B,
+                False,
+                attention_mask,
+                True,
+                prune_ratio=self.output.dense.lora_A.default.prune_ratio
+            )
+            #! fuse layernorm there
+            outputs = self.output.dropout(outputs)
+            outputs = self.output.LayerNorm(outputs + hidden_states)
+            outputs = (outputs,)
+        else:
+            self_outputs = self.self(
+                hidden_states,
+                attention_mask,
+                head_mask,
+                encoder_hidden_states,
+                encoder_attention_mask,
+                past_key_value,
+                output_attentions,
+            )
+            attention_output = self.output(self_outputs[0], hidden_states)
+            outputs = (attention_output,) + self_outputs[1:]  # add attentions if we output them
         return outputs
 
 
