@@ -46,6 +46,7 @@ from ...utils import (
 from .configuration_roberta import RobertaConfig
 
 from gact.mixed_layers.mixed_sparse_full_attention import MixedSparseFullAttention
+from gact.mixed_layers.mixed_sparse_layers_arch_1 import MixedSparseSingleLayer
 
 logger = logging.get_logger(__name__)
 
@@ -443,6 +444,11 @@ class RobertaLayer(nn.Module):
             self.crossattention = RobertaAttention(config, position_embedding_type="absolute")
         self.intermediate = RobertaIntermediate(config)
         self.output = RobertaOutput(config)
+        self.mixed_sparse_layer = MixedSparseSingleLayer(
+            hidden_dim=config.hidden_size,
+            num_heads=config.num_attention_heads,
+        )
+        self.use_mixed_sparse_layer = False
 
     def forward(
         self,
@@ -454,58 +460,61 @@ class RobertaLayer(nn.Module):
         past_key_value: Optional[Tuple[Tuple[torch.FloatTensor]]] = None,
         output_attentions: Optional[bool] = False,
     ) -> Tuple[torch.Tensor]:
-        # decoder uni-directional self-attention cached key/values tuple is at positions 1,2
-        self_attn_past_key_value = past_key_value[:2] if past_key_value is not None else None
-        self_attention_outputs = self.attention(
-            hidden_states,
-            attention_mask,
-            head_mask,
-            output_attentions=output_attentions,
-            past_key_value=self_attn_past_key_value,
-        )
-        attention_output = self_attention_outputs[0]
-
-        # if decoder, the last output is tuple of self-attn cache
-        if self.is_decoder:
-            outputs = self_attention_outputs[1:-1]
-            present_key_value = self_attention_outputs[-1]
+        if self.use_mixed_sparse_layer:
+            pass
         else:
-            outputs = self_attention_outputs[1:]  # add self attentions if we output attention weights
-
-        cross_attn_present_key_value = None
-        if self.is_decoder and encoder_hidden_states is not None:
-            if not hasattr(self, "crossattention"):
-                raise ValueError(
-                    f"If `encoder_hidden_states` are passed, {self} has to be instantiated with cross-attention layers"
-                    " by setting `config.add_cross_attention=True`"
-                )
-
-            # cross_attn cached key/values tuple is at positions 3,4 of past_key_value tuple
-            cross_attn_past_key_value = past_key_value[-2:] if past_key_value is not None else None
-            cross_attention_outputs = self.crossattention(
-                attention_output,
+            # decoder uni-directional self-attention cached key/values tuple is at positions 1,2
+            self_attn_past_key_value = past_key_value[:2] if past_key_value is not None else None
+            self_attention_outputs = self.attention(
+                hidden_states,
                 attention_mask,
                 head_mask,
-                encoder_hidden_states,
-                encoder_attention_mask,
-                cross_attn_past_key_value,
-                output_attentions,
+                output_attentions=output_attentions,
+                past_key_value=self_attn_past_key_value,
             )
-            attention_output = cross_attention_outputs[0]
-            outputs = outputs + cross_attention_outputs[1:-1]  # add cross attentions if we output attention weights
+            attention_output = self_attention_outputs[0]
 
-            # add cross-attn cache to positions 3,4 of present_key_value tuple
-            cross_attn_present_key_value = cross_attention_outputs[-1]
-            present_key_value = present_key_value + cross_attn_present_key_value
+            # if decoder, the last output is tuple of self-attn cache
+            if self.is_decoder:
+                outputs = self_attention_outputs[1:-1]
+                present_key_value = self_attention_outputs[-1]
+            else:
+                outputs = self_attention_outputs[1:]  # add self attentions if we output attention weights
 
-        layer_output = apply_chunking_to_forward(
-            self.feed_forward_chunk, self.chunk_size_feed_forward, self.seq_len_dim, attention_output
-        )
-        outputs = (layer_output,) + outputs
+            cross_attn_present_key_value = None
+            if self.is_decoder and encoder_hidden_states is not None:
+                if not hasattr(self, "crossattention"):
+                    raise ValueError(
+                        f"If `encoder_hidden_states` are passed, {self} has to be instantiated with cross-attention layers"
+                        " by setting `config.add_cross_attention=True`"
+                    )
 
-        # if decoder, return the attn key/values as the last output
-        if self.is_decoder:
-            outputs = outputs + (present_key_value,)
+                # cross_attn cached key/values tuple is at positions 3,4 of past_key_value tuple
+                cross_attn_past_key_value = past_key_value[-2:] if past_key_value is not None else None
+                cross_attention_outputs = self.crossattention(
+                    attention_output,
+                    attention_mask,
+                    head_mask,
+                    encoder_hidden_states,
+                    encoder_attention_mask,
+                    cross_attn_past_key_value,
+                    output_attentions,
+                )
+                attention_output = cross_attention_outputs[0]
+                outputs = outputs + cross_attention_outputs[1:-1]  # add cross attentions if we output attention weights
+
+                # add cross-attn cache to positions 3,4 of present_key_value tuple
+                cross_attn_present_key_value = cross_attention_outputs[-1]
+                present_key_value = present_key_value + cross_attn_present_key_value
+
+            layer_output = apply_chunking_to_forward(
+                self.feed_forward_chunk, self.chunk_size_feed_forward, self.seq_len_dim, attention_output
+            )
+            outputs = (layer_output,) + outputs
+
+            # if decoder, return the attn key/values as the last output
+            if self.is_decoder:
+                outputs = outputs + (present_key_value,)
 
         return outputs
 

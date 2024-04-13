@@ -43,6 +43,7 @@ from .configuration_opt import OPTConfig
 
 from gact.mixed_layers.mixed_sparse_attention import MixedSparseAttention
 from gact.mixed_layers.mixed_sparse_traditional_mlp import MixedSparseTraditionalMLP
+from gact.mixed_layers.mixed_sparse_layers_arch_1 import MixedSparseSingleLayer
 
 if is_flash_attn_2_available():
     from flash_attn import flash_attn_func, flash_attn_varlen_func
@@ -533,7 +534,7 @@ OPT_ATTENTION_CLASSES = {
     "flash_attention_2": OptFlashAttention2,
 }
 
-
+#! full layer operation there
 class OPTDecoderLayer(nn.Module):
     def __init__(self, config: OPTConfig):
         super().__init__()
@@ -554,6 +555,9 @@ class OPTDecoderLayer(nn.Module):
 
         self.enable_memory_efficient = False
         self.mixed_sparse_mlp = MixedSparseTraditionalMLP(quantization=False)
+        
+        self.use_full_layer = True
+        self.mixed_full_layer = MixedSparseSingleLayer(quantization=False)
 
     def forward(
         self,
@@ -579,70 +583,106 @@ class OPTDecoderLayer(nn.Module):
                 (see `past_key_values`).
             past_key_value (`Tuple(torch.FloatTensor)`, *optional*): cached past key and value projection states
         """
-
-        residual = hidden_states
-
-        # 125m, 1.7B, ..., 175B applies layer norm BEFORE attention
-        if self.do_layer_norm_before:
-            hidden_states = self.self_attn_layer_norm(hidden_states)
-
-        # Self Attention
-        hidden_states, self_attn_weights, present_key_value = self.self_attn(
-            hidden_states=hidden_states,
-            past_key_value=past_key_value,
-            attention_mask=attention_mask,
-            layer_head_mask=layer_head_mask,
-            output_attentions=output_attentions,
-        )
-        hidden_states = nn.functional.dropout(hidden_states, p=self.dropout, training=self.training)
-        hidden_states = residual + hidden_states
-
-        # 350m applies layer norm AFTER attention
-        if not self.do_layer_norm_before:
-            hidden_states = self.self_attn_layer_norm(hidden_states)
-
-        # Fully Connected
-        hidden_states_shape = hidden_states.shape
-        hidden_states = hidden_states.reshape(-1, hidden_states.size(-1))
-        residual = hidden_states
-
-        # 125m, 1.7B, ..., 175B applies layer norm BEFORE fc
-        if self.do_layer_norm_before:
-            hidden_states = self.final_layer_norm(hidden_states)
-
-        if self.enable_memory_efficient:
-            # convert the hidden state to original shape
-            hidden_states = hidden_states.view(hidden_states_shape)
-            hidden_states = self.mixed_sparse_mlp(
-                hidden_states,
-                self.fc1.base_layer,
-                self.fc1.lora_A,
-                self.fc1.lora_B,
-                self.fc2.base_layer,
-                self.fc2.lora_A,
-                self.fc2.lora_B,
+        if self.use_full_layer:
+            outputs = self.mixed_full_layer.forward(
+                input=hidden_states,
+                norm_weight_1=self.self_attn_layer_norm.weight,
+                norm_bias_1=self.self_attn_layer_norm.bias,
+                q_proj_base=self.self_attn.q_proj.base_layer,
+                q_proj_lora_a=self.self_attn.q_proj.lora_A,
+                q_proj_lora_b=self.self_attn.q_proj.lora_B,
+                k_proj_base=self.self_attn.k_proj.base_layer,
+                k_proj_lora_a=self.self_attn.k_proj.lora_A,
+                k_proj_lora_b=self.self_attn.k_proj.lora_B,
+                v_proj_base=self.self_attn.v_proj.base_layer,
+                v_proj_lora_a=self.self_attn.v_proj.lora_A,
+                v_proj_lora_b=self.self_attn.v_proj.lora_B,
+                o_proj_base=self.self_attn.out_proj.base_layer,
+                o_proj_lora_a=self.self_attn.out_proj.lora_A,
+                o_proj_lora_b=self.self_attn.out_proj.lora_B,
+                #############################################
+                norm_weight_2=self.final_layer_norm.weight,
+                norm_bias_2=self.final_layer_norm.bias,
+                up_proj_base=self.fc1.base_layer,
+                up_proj_lora_a=self.fc1.lora_A,
+                up_proj_lora_b=self.fc1.lora_B,
+                down_proj_base=self.fc2.base_layer,
+                down_proj_lora_a=self.fc2.lora_A,
+                down_proj_lora_b=self.fc2.lora_B,
+                attention_mask=attention_mask,
+                norm_mode='layernorm',
+                num_heads=self.self_attn.num_heads,
+                use_rotary_pos_enc=False,
+                small_value_approx=False,
+                activation_forward='relu',
+                activation_backward='relu',
             )
-            hidden_states = hidden_states.view(-1, hidden_states.size(-1))
+            outputs = (outputs,)
+            
         else:
-            hidden_states = self.fc1(hidden_states)
-            hidden_states = self.activation_fn(hidden_states)
+            residual = hidden_states
 
-            hidden_states = self.fc2(hidden_states)
+            # 125m, 1.7B, ..., 175B applies layer norm BEFORE attention
+            if self.do_layer_norm_before:
+                hidden_states = self.self_attn_layer_norm(hidden_states)
+
+            # Self Attention
+            hidden_states, self_attn_weights, present_key_value = self.self_attn(
+                hidden_states=hidden_states,
+                past_key_value=past_key_value,
+                attention_mask=attention_mask,
+                layer_head_mask=layer_head_mask,
+                output_attentions=output_attentions,
+            )
             hidden_states = nn.functional.dropout(hidden_states, p=self.dropout, training=self.training)
+            hidden_states = residual + hidden_states
 
-        hidden_states = (residual + hidden_states).view(hidden_states_shape)
+            # 350m applies layer norm AFTER attention
+            if not self.do_layer_norm_before:
+                hidden_states = self.self_attn_layer_norm(hidden_states)
 
-        # 350m applies layer norm AFTER fc
-        if not self.do_layer_norm_before:
-            hidden_states = self.final_layer_norm(hidden_states)
+            # Fully Connected
+            hidden_states_shape = hidden_states.shape
+            hidden_states = hidden_states.reshape(-1, hidden_states.size(-1))
+            residual = hidden_states
 
-        outputs = (hidden_states,)
+            # 125m, 1.7B, ..., 175B applies layer norm BEFORE fc
+            if self.do_layer_norm_before:
+                hidden_states = self.final_layer_norm(hidden_states)
 
-        if output_attentions:
-            outputs += (self_attn_weights,)
+            if self.enable_memory_efficient:
+                # convert the hidden state to original shape
+                hidden_states = hidden_states.view(hidden_states_shape)
+                hidden_states = self.mixed_sparse_mlp(
+                    hidden_states,
+                    self.fc1.base_layer,
+                    self.fc1.lora_A,
+                    self.fc1.lora_B,
+                    self.fc2.base_layer,
+                    self.fc2.lora_A,
+                    self.fc2.lora_B,
+                )
+                hidden_states = hidden_states.view(-1, hidden_states.size(-1))
+            else:
+                hidden_states = self.fc1(hidden_states)
+                hidden_states = self.activation_fn(hidden_states)
 
-        if use_cache:
-            outputs += (present_key_value,)
+                hidden_states = self.fc2(hidden_states)
+                hidden_states = nn.functional.dropout(hidden_states, p=self.dropout, training=self.training)
+
+            hidden_states = (residual + hidden_states).view(hidden_states_shape)
+
+            # 350m applies layer norm AFTER fc
+            if not self.do_layer_norm_before:
+                hidden_states = self.final_layer_norm(hidden_states)
+
+            outputs = (hidden_states,)
+
+            if output_attentions:
+                outputs += (self_attn_weights,)
+
+            if use_cache:
+                outputs += (present_key_value,)
 
         return outputs
 
