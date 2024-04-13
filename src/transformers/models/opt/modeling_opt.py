@@ -588,6 +588,8 @@ class OPTDecoderLayer(nn.Module):
                 input=hidden_states,
                 norm_weight_1=self.self_attn_layer_norm.weight,
                 norm_bias_1=self.self_attn_layer_norm.bias,
+                cos=None,
+                sin=None,
                 q_proj_base=self.self_attn.q_proj.base_layer,
                 q_proj_lora_a=self.self_attn.q_proj.lora_A,
                 q_proj_lora_b=self.self_attn.q_proj.lora_B,
@@ -609,6 +611,7 @@ class OPTDecoderLayer(nn.Module):
                 down_proj_base=self.fc2.base_layer,
                 down_proj_lora_a=self.fc2.lora_A,
                 down_proj_lora_b=self.fc2.lora_B,
+                #############################################
                 attention_mask=attention_mask,
                 norm_mode='layernorm',
                 num_heads=self.self_attn.num_heads,
