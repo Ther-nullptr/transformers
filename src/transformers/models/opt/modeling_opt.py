@@ -556,8 +556,11 @@ class OPTDecoderLayer(nn.Module):
         self.enable_memory_efficient = False
         self.mixed_sparse_mlp = MixedSparseTraditionalMLP(quantization=False)
         
-        self.use_full_layer = True
-        self.mixed_full_layer = MixedSparseSingleLayer(quantization=False)
+        self.use_full_layer = False
+        self.mixed_full_layer = MixedSparseSingleLayer(
+            hidden_dim=self.embed_dim,
+            num_heads=self.self_attn.num_heads,
+        )
 
     def forward(
         self,
@@ -583,7 +586,7 @@ class OPTDecoderLayer(nn.Module):
                 (see `past_key_values`).
             past_key_value (`Tuple(torch.FloatTensor)`, *optional*): cached past key and value projection states
         """
-        if self.use_full_layer:
+        if self.use_full_layer and self.training:
             outputs = self.mixed_full_layer.forward(
                 input=hidden_states,
                 norm_weight_1=self.self_attn_layer_norm.weight,
@@ -615,6 +618,7 @@ class OPTDecoderLayer(nn.Module):
                 attention_mask=attention_mask,
                 norm_mode='layernorm',
                 num_heads=self.self_attn.num_heads,
+                head_dim=self.self_attn.head_dim,
                 use_rotary_pos_enc=False,
                 small_value_approx=False,
                 activation_forward='relu',
@@ -1014,7 +1018,7 @@ class OPTDecoder(OPTPreTrainedModel):
 
             hidden_states = layer_outputs[0]
 
-            if use_cache:
+            if use_cache and not self.training: #! only for debug to jump out of the loop
                 next_decoder_cache += (layer_outputs[2 if output_attentions else 1],)
 
             if output_attentions:
