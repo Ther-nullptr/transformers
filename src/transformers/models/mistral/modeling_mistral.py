@@ -44,7 +44,7 @@ from .configuration_mistral import MistralConfig
 
 from gact.mixed_layers.mixed_sparse_attention import MixedSparseAttention
 from gact.mixed_layers.mixed_sparse_gated_mlp import MixedSparseGatedMLP
-
+from gact.mixed_layers.mixed_sparse_layers_arch_2 import MixedSparseSingleLayerWithGate
 
 if is_flash_attn_2_available():
     from flash_attn import flash_attn_func, flash_attn_varlen_func
@@ -637,6 +637,12 @@ class MistralDecoderLayer(nn.Module):
         self.mlp = MistralMLP(config)
         self.input_layernorm = MistralRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.post_attention_layernorm = MistralRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        
+        self.use_full_layer = False
+        self.full_layer = MixedSparseSingleLayerWithGate(
+            hidden_dim=config.hidden_size,
+            num_heads=config.num_attention_heads,
+        )
 
     def forward(
         self,
@@ -665,35 +671,86 @@ class MistralDecoderLayer(nn.Module):
                 (see `past_key_values`).
             past_key_value (`Tuple(torch.FloatTensor)`, *optional*): cached past key and value projection states
         """
+        if self.use_full_layer and self.training:
+            # generate cos & sin firstly
+            cos, sin = self.self_attn.rotary_emb.forward(hidden_states, seq_len=hidden_states.size(1))
+            outputs = self.full_layer.forward(
+                input=hidden_states,
+                norm_weight_1=self.input_layernorm.weight,
+                norm_bias_1=None,
+                cos=cos,
+                sin=sin,
+                position_ids=position_ids,
+                q_proj_base=self.self_attn.q_proj.base_layer,
+                q_proj_lora_a=self.self_attn.q_proj.lora_A,
+                q_proj_lora_b=self.self_attn.q_proj.lora_B,
+                k_proj_base=self.self_attn.k_proj.base_layer,
+                k_proj_lora_a=self.self_attn.k_proj.lora_A,
+                k_proj_lora_b=self.self_attn.k_proj.lora_B,
+                v_proj_base=self.self_attn.v_proj.base_layer,
+                v_proj_lora_a=self.self_attn.v_proj.lora_A,
+                v_proj_lora_b=self.self_attn.v_proj.lora_B,
+                o_proj_base=self.self_attn.o_proj.base_layer,
+                o_proj_lora_a=self.self_attn.o_proj.lora_A,
+                o_proj_lora_b=self.self_attn.o_proj.lora_B,
+                #############################################
+                norm_weight_2=self.post_attention_layernorm.weight,
+                norm_bias_2=None,
+                gate_proj_base=self.mlp.gate_proj.base_layer,
+                gate_proj_lora_a=self.mlp.gate_proj.lora_A,
+                gate_proj_lora_b=self.mlp.gate_proj.lora_B,
+                up_proj_base=self.mlp.up_proj.base_layer,
+                up_proj_lora_a=self.mlp.up_proj.lora_A,
+                up_proj_lora_b=self.mlp.up_proj.lora_B,
+                down_proj_base=self.mlp.down_proj.base_layer,
+                down_proj_lora_a=self.mlp.down_proj.lora_A,
+                down_proj_lora_b=self.mlp.down_proj.lora_B,
+                #############################################
+                attention_mask=attention_mask,
+                norm_mode='rmsnorm',
+                num_heads=self.self_attn.num_heads,
+                head_dim=self.self_attn.head_dim,
+                use_rotary_pos_enc=True,
+                small_value_approx=False,
+                activation_forward='silu',
+                activation_backward='silu',
+                #############################################
+                prune=True,
+                prune_ratio=0.9,
+                shrink_head_ratio=4,
+                #############################################
+                training=self.training
+            )
+            outputs = (outputs,)
+        else:
+            residual = hidden_states
 
-        residual = hidden_states
+            hidden_states = self.input_layernorm(hidden_states)
 
-        hidden_states = self.input_layernorm(hidden_states)
+            # Self Attention
+            hidden_states, self_attn_weights, present_key_value = self.self_attn(
+                hidden_states=hidden_states,
+                attention_mask=attention_mask,
+                position_ids=position_ids,
+                past_key_value=past_key_value,
+                output_attentions=output_attentions,
+                use_cache=use_cache,
+            )
+            hidden_states = residual + hidden_states
 
-        # Self Attention
-        hidden_states, self_attn_weights, present_key_value = self.self_attn(
-            hidden_states=hidden_states,
-            attention_mask=attention_mask,
-            position_ids=position_ids,
-            past_key_value=past_key_value,
-            output_attentions=output_attentions,
-            use_cache=use_cache,
-        )
-        hidden_states = residual + hidden_states
+            # Fully Connected
+            residual = hidden_states
+            hidden_states = self.post_attention_layernorm(hidden_states)
+            hidden_states = self.mlp(hidden_states)
+            hidden_states = residual + hidden_states
 
-        # Fully Connected
-        residual = hidden_states
-        hidden_states = self.post_attention_layernorm(hidden_states)
-        hidden_states = self.mlp(hidden_states)
-        hidden_states = residual + hidden_states
+            outputs = (hidden_states,)
 
-        outputs = (hidden_states,)
+            if output_attentions:
+                outputs += (self_attn_weights,)
 
-        if output_attentions:
-            outputs += (self_attn_weights,)
-
-        if use_cache:
-            outputs += (present_key_value,)
+            if use_cache:
+                outputs += (present_key_value,)
 
         return outputs
 

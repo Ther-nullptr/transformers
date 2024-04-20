@@ -244,9 +244,9 @@ class OPTAttention(nn.Module):
             key_states = key_states.view(*new_proj_shape)
             value_states = value_states.view(*new_proj_shape)
             attn_output = self.mixed_sparse_attention.forward(
-                query_states, 
-                key_states, 
-                value_states, 
+                query_states,
+                key_states,
+                value_states,
                 attention_mask,
                 self.sparsity_ratio,
                 self.maintain_heads
@@ -623,6 +623,11 @@ class OPTDecoderLayer(nn.Module):
                 small_value_approx=False,
                 activation_forward='relu',
                 activation_backward='relu',
+                #############################################
+                prune=True,
+                prune_ratio=0.95,
+                #############################################
+                training = self.training
             )
             outputs = (outputs,)
             
@@ -1025,7 +1030,8 @@ class OPTDecoder(OPTPreTrainedModel):
                 all_self_attns += (layer_outputs[1],)
 
         if self.final_layer_norm is not None:
-            hidden_states = self.final_layer_norm(hidden_states)
+            hidden_states = hidden_states.to(self.final_layer_norm.weight.dtype)
+            hidden_states = self.final_layer_norm.forward(hidden_states)
 
         if self.project_out is not None:
             hidden_states = self.project_out(hidden_states)
