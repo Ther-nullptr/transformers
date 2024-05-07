@@ -220,6 +220,12 @@ class OPTAttention(nn.Module):
             # self_attention
             key_states = self._shape(self.k_proj(hidden_states), -1, bsz)
             value_states = self._shape(self.v_proj(hidden_states), -1, bsz)
+            
+        #! get x_lora_a of q,k,v to simulate the algorithm
+        if self.gemm1.__class__.__name__ == 'EfficientMemoryGEMMFuseLoRA':
+            q_lora_a = self.q_proj.lora_A.default(hidden_states)
+            k_lora_a = self.k_proj.lora_A.default(hidden_states)
+            v_lora_a = self.v_proj.lora_A.default(hidden_states)
 
         if self.is_decoder:
             # if cross_attention save Tuple(torch.Tensor, torch.Tensor) of all cross attention key/value_states.
@@ -244,9 +250,9 @@ class OPTAttention(nn.Module):
             key_states = key_states.view(*new_proj_shape)
             value_states = value_states.view(*new_proj_shape)
             attn_output = self.mixed_sparse_attention.forward(
-                query_states, 
-                key_states, 
-                value_states, 
+                query_states,
+                key_states,
+                value_states,
                 attention_mask,
                 self.sparsity_ratio,
                 self.maintain_heads
@@ -254,8 +260,11 @@ class OPTAttention(nn.Module):
             attn_output = attn_output.view(*proj_shape)
             attn_weights_reshaped = None
         else:
-            attn_weights = self.gemm1(query_states, key_states.transpose(1, 2))
-
+            if self.gemm1.__class__.__name__ == 'EfficientMemoryGEMMFuseLoRA':
+                attn_weights = self.gemm1(query_states, key_states.transpose(1, 2), q_lora_a, k_lora_a, self.q_proj.lora_B.default.weight.T, self.k_proj.lora_B.default.weight.T, bsz) #! for lora_fused version
+            else:
+                attn_weights = self.gemm1(query_states, key_states.transpose(1, 2)) #! for naive version
+            
             if attn_weights.size() != (bsz * self.num_heads, tgt_len, src_len):
                 raise ValueError(
                     f"Attention weights should be of size {(bsz * self.num_heads, tgt_len, src_len)}, but is"
@@ -300,7 +309,11 @@ class OPTAttention(nn.Module):
 
             attn_probs = nn.functional.dropout(attn_weights, p=self.dropout, training=self.training)
 
-            attn_output = self.gemm2(attn_probs, value_states)
+            # attn_output = self.gemm2(attn_probs, value_states)
+            if self.gemm1.__class__.__name__ == 'EfficientMemoryGEMMFuseLoRA':
+                attn_output = self.gemm2(attn_probs, value_states, k_lora_a, v_lora_a, self.k_proj.lora_B.default.weight.T, self.v_proj.lora_B.default.weight.T, bsz) #! for lora_fused version (notice self.k_proj is dummy here)
+            else:
+                attn_output = self.gemm2(attn_probs, value_states)
 
         if attn_output.size() != (bsz * self.num_heads, tgt_len, self.head_dim):
             raise ValueError(
@@ -623,6 +636,11 @@ class OPTDecoderLayer(nn.Module):
                 small_value_approx=False,
                 activation_forward='relu',
                 activation_backward='relu',
+                #############################################
+                prune=True,
+                prune_ratio=0.90,
+                #############################################
+                training = self.training
             )
             outputs = (outputs,)
             
@@ -1025,7 +1043,8 @@ class OPTDecoder(OPTPreTrainedModel):
                 all_self_attns += (layer_outputs[1],)
 
         if self.final_layer_norm is not None:
-            hidden_states = self.final_layer_norm(hidden_states)
+            hidden_states = hidden_states.to(self.final_layer_norm.weight.dtype)
+            hidden_states = self.final_layer_norm.forward(hidden_states)
 
         if self.project_out is not None:
             hidden_states = self.project_out(hidden_states)

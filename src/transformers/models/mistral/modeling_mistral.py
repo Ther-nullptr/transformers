@@ -190,7 +190,7 @@ class MistralMLP(nn.Module):
         self.up_proj = nn.Linear(self.hidden_size, self.intermediate_size, bias=False)
         self.down_proj = nn.Linear(self.intermediate_size, self.hidden_size, bias=False)
         self.act_fn = ACT2FN[config.hidden_act]
-
+        self.hadamard = MistralHadamard()
         self.enable_memory_efficient = False
         self.mixed_sparse_mlp = MixedSparseGatedMLP(activation_forward='silu')
 
@@ -209,7 +209,17 @@ class MistralMLP(nn.Module):
                 self.down_proj.lora_B,
             )
         else:
-            return self.down_proj(self.act_fn(self.gate_proj(x)) * self.up_proj(x))
+            gate = self.act_fn(self.gate_proj(x))
+            up = self.up_proj(x)
+            if self.hadamard.__class__.__name__ == 'EfficientMemoryHadamardFuseLoRA':
+                bsz = x.shape[0]
+                mask = gate > 0
+                gate_lora_a = self.gate_proj.lora_A.default(x)
+                up_lora_a = self.up_proj.lora_A.default(x)
+                hadamard = self.hadamard(gate, up, mask, gate_lora_a, up_lora_a, self.gate_proj.lora_B.default.weight.T, self.up_proj.lora_B.default.weight.T, bsz)
+            else:
+                hadamard = self.hadamard(gate, up)
+            return self.down_proj(hadamard)
 
 
 # Copied from transformers.models.llama.modeling_llama.repeat_kv
