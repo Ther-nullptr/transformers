@@ -117,6 +117,13 @@ class LlamaGEMM(nn.Module):
         return x1 @ x2
 
 
+class LlamaFlashAttention(nn.Module):
+    def __init__(self):
+        super().__init__()
+        
+    def forward(self):
+        return None
+
 class LlamaRMSNorm(nn.Module):
     def __init__(self, hidden_size, eps=1e-6):
         """
@@ -339,6 +346,8 @@ class LlamaAttention(nn.Module):
         self.softmax = nn.Softmax(dim=-1)
         self.gemm1 = LlamaGEMM(attention_first=False)
         self.gemm2 = LlamaGEMM(attention_first=True)
+        
+        self.flash_attention = LlamaFlashAttention() #! just a place holder, finally it will be replaced by the actual flash attention module
 
     def _init_rope(self):
         if self.config.rope_scaling is None:
