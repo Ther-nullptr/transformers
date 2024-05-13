@@ -75,16 +75,32 @@ def _get_unpad_data(attention_mask):
         cu_seqlens,
         max_seqlen_in_batch,
     )
+    
+
+class GemmaGEMM(nn.Module):
+    def __init__(self):
+        super().__init__()
+        
+    def forward(self, x1, x2):
+        return x1 @ x2
+    
+    
+class GemmaHadamard(nn.Module):
+    def __init__(self):
+        super().__init__()
+        
+    def forward(self, x1, x2):
+        return x1 * x2
 
 
 class GemmaRMSNorm(nn.Module):
     def __init__(self, dim: int, eps: float = 1e-6):
         super().__init__()
-        self.eps = eps
+        self.variance_epsilon = eps
         self.weight = nn.Parameter(torch.zeros(dim))
 
     def _norm(self, x):
-        return x * torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + self.eps)
+        return x * torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + self.variance_epsilon)
 
     def forward(self, x):
         output = self._norm(x.float())
@@ -182,9 +198,10 @@ class GemmaMLP(nn.Module):
             config.hidden_activation = "gelu_pytorch_tanh"
         hidden_activation = config.hidden_activation
         self.act_fn = ACT2FN[hidden_activation]
+        self.hadamard = GemmaHadamard()
 
     def forward(self, x):
-        return self.down_proj(self.act_fn(self.gate_proj(x)) * self.up_proj(x))
+        return self.down_proj(self.hadamard(self.act_fn(self.gate_proj(x)), self.up_proj(x)))
 
 
 # Copied from transformers.models.llama.modeling_llama.repeat_kv
@@ -224,6 +241,10 @@ class GemmaAttention(nn.Module):
         self.max_position_embeddings = config.max_position_embeddings
         self.rope_theta = config.rope_theta
         self.is_causal = True
+        
+        self.gemm1 = GemmaGEMM()
+        self.gemm2 = GemmaGEMM()
+        self.softmax = nn.Softmax(dim=-1)
 
         if self.hidden_size % self.num_heads != 0:
             raise ValueError(
@@ -273,16 +294,16 @@ class GemmaAttention(nn.Module):
         key_states = repeat_kv(key_states, self.num_key_value_groups)
         value_states = repeat_kv(value_states, self.num_key_value_groups)
 
-        attn_weights = torch.matmul(query_states, key_states.transpose(2, 3)) / math.sqrt(self.head_dim)
+        attn_weights = self.gemm1(query_states, key_states.transpose(2, 3)) / math.sqrt(self.head_dim)
 
         if attention_mask is not None:  # no matter the length, we just slice it
             causal_mask = attention_mask[:, :, :, : key_states.shape[-2]]
             attn_weights = attn_weights + causal_mask
 
         # upcast attention to fp32
-        attn_weights = nn.functional.softmax(attn_weights, dim=-1, dtype=torch.float32).to(query_states.dtype)
+        attn_weights = self.softmax(attn_weights).to(query_states.dtype)
         attn_weights = nn.functional.dropout(attn_weights, p=self.attention_dropout, training=self.training)
-        attn_output = torch.matmul(attn_weights, value_states)
+        attn_output = self.gemm2(attn_weights, value_states)
 
         if attn_output.size() != (bsz, self.num_heads, q_len, self.head_dim):
             raise ValueError(
