@@ -523,7 +523,7 @@ class _BaseAutoModelClass:
             config, kwargs = AutoConfig.from_pretrained(
                 pretrained_model_name_or_path,
                 return_unused_kwargs=True,
-                trust_remote_code=trust_remote_code,
+                trust_remote_code=True,
                 code_revision=code_revision,
                 _commit_hash=commit_hash,
                 **hub_kwargs,
