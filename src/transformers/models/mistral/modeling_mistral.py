@@ -57,7 +57,6 @@ logger = logging.get_logger(__name__)
 
 _CONFIG_FOR_DOC = "MistralConfig"
 
-
 # Copied from transformers.models.llama.modeling_llama._get_unpad_data
 def _get_unpad_data(attention_mask):
     seqlens_in_batch = attention_mask.sum(dim=-1, dtype=torch.int32)
@@ -219,7 +218,8 @@ class MistralMLP(nn.Module):
                 hadamard = self.hadamard(gate, up, mask, gate_lora_a, up_lora_a, self.gate_proj.lora_B.default.weight.T, self.up_proj.lora_B.default.weight.T, bsz)
             else:
                 hadamard = self.hadamard(gate, up)
-            return self.down_proj(hadamard)
+            result = self.down_proj(hadamard)
+            return result
 
 
 # Copied from transformers.models.llama.modeling_llama.repeat_kv
@@ -734,9 +734,7 @@ class MistralDecoderLayer(nn.Module):
             outputs = (outputs,)
         else:
             residual = hidden_states
-
             hidden_states = self.input_layernorm(hidden_states)
-
             # Self Attention
             hidden_states, self_attn_weights, present_key_value = self.self_attn(
                 hidden_states=hidden_states,

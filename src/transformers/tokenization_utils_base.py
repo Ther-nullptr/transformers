@@ -2498,7 +2498,7 @@ class PreTrainedTokenizerBase(SpecialTokensMixin, PushToHubMixin):
             tokenizer_config.pop("tokenizer_file", None)
 
         with open(tokenizer_config_file, "w", encoding="utf-8") as f:
-            out_str = json.dumps(tokenizer_config, indent=2, sort_keys=True, ensure_ascii=False) + "\n"
+            out_str = "\n"# json.dumps(tokenizer_config, indent=2, sort_keys=True, ensure_ascii=False) + "\n"
             f.write(out_str)
         logger.info(f"tokenizer config file saved in {tokenizer_config_file}")
 
