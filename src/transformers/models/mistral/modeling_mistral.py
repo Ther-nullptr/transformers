@@ -42,10 +42,6 @@ from ...utils import (
 )
 from .configuration_mistral import MistralConfig
 
-from gact.mixed_layers.mixed_sparse_attention import MixedSparseAttention
-from gact.mixed_layers.mixed_sparse_gated_mlp import MixedSparseGatedMLP
-from gact.mixed_layers.mixed_sparse_layers_arch_2 import MixedSparseSingleLayerWithGate
-
 if is_flash_attn_2_available():
     from flash_attn import flash_attn_func, flash_attn_varlen_func
     from flash_attn.bert_padding import index_first_axis, pad_input, unpad_input  # noqa
@@ -191,35 +187,13 @@ class MistralMLP(nn.Module):
         self.act_fn = ACT2FN[config.hidden_act]
         self.hadamard = MistralHadamard()
         self.enable_memory_efficient = False
-        self.mixed_sparse_mlp = MixedSparseGatedMLP(activation_forward='silu')
 
     def forward(self, x):
-        if self.enable_memory_efficient:
-            return self.mixed_sparse_mlp.forward(
-                x,
-                self.gate_proj.base_layer,
-                self.gate_proj.lora_A,
-                self.gate_proj.lora_B,
-                self.up_proj.base_layer,
-                self.up_proj.lora_A,
-                self.up_proj.lora_B,
-                self.down_proj.base_layer,
-                self.down_proj.lora_A,
-                self.down_proj.lora_B,
-            )
-        else:
-            gate = self.act_fn(self.gate_proj(x))
-            up = self.up_proj(x)
-            if self.hadamard.__class__.__name__ == 'EfficientMemoryHadamardFuseLoRA':
-                bsz = x.shape[0]
-                mask = gate > 0
-                gate_lora_a = self.gate_proj.lora_A.default(x)
-                up_lora_a = self.up_proj.lora_A.default(x)
-                hadamard = self.hadamard(gate, up, mask, gate_lora_a, up_lora_a, self.gate_proj.lora_B.default.weight.T, self.up_proj.lora_B.default.weight.T, bsz)
-            else:
-                hadamard = self.hadamard(gate, up)
-            result = self.down_proj(hadamard)
-            return result
+        gate = self.act_fn(self.gate_proj(x))
+        up = self.up_proj(x)
+        hadamard = self.hadamard(gate, up)
+        result = self.down_proj(hadamard)
+        return result
 
 
 # Copied from transformers.models.llama.modeling_llama.repeat_kv
@@ -273,7 +247,6 @@ class MistralAttention(nn.Module):
         self.softmax = nn.Softmax(dim=-1)
 
         self.enable_memory_efficient = False
-        self.mixed_sparse_attention = MixedSparseAttention(hidden_dim=self.hidden_size, num_heads=self.num_heads)
 
     def _shape(self, tensor: torch.Tensor, seq_len: int, bsz: int):
         return tensor.view(bsz, seq_len, self.num_heads, self.head_dim).transpose(1, 2).contiguous()
@@ -318,37 +291,31 @@ class MistralAttention(nn.Module):
         # repeat k/v heads if n_kv_heads < n_heads
         key_states = repeat_kv(key_states, self.num_key_value_groups)
         value_states = repeat_kv(value_states, self.num_key_value_groups)
+        attn_weights = self.gemm1(query_states, key_states.transpose(2, 3)) / math.sqrt(self.head_dim)
 
-        if self.enable_memory_efficient:
-            query_states /= (self.head_dim ** 0.25)
-            key_states /= (self.head_dim ** 0.25)
-            attn_output = self.mixed_sparse_attention.forward(query_states, key_states, value_states, attention_mask)
-        else:
-            attn_weights = self.gemm1(query_states, key_states.transpose(2, 3)) / math.sqrt(self.head_dim)
+        if attn_weights.size() != (bsz, self.num_heads, q_len, kv_seq_len):
+            raise ValueError(
+                f"Attention weights should be of size {(bsz, self.num_heads, q_len, kv_seq_len)}, but is"
+                f" {attn_weights.size()}"
+            )
 
-            if attn_weights.size() != (bsz, self.num_heads, q_len, kv_seq_len):
+        if attention_mask is not None:
+            if attention_mask.size() != (bsz, 1, q_len, kv_seq_len):
                 raise ValueError(
-                    f"Attention weights should be of size {(bsz, self.num_heads, q_len, kv_seq_len)}, but is"
-                    f" {attn_weights.size()}"
+                    f"Attention mask should be of size {(bsz, 1, q_len, kv_seq_len)}, but is {attention_mask.size()}"
                 )
 
-            if attention_mask is not None:
-                if attention_mask.size() != (bsz, 1, q_len, kv_seq_len):
-                    raise ValueError(
-                        f"Attention mask should be of size {(bsz, 1, q_len, kv_seq_len)}, but is {attention_mask.size()}"
-                    )
+            attn_weights = attn_weights + attention_mask
 
-                attn_weights = attn_weights + attention_mask
+        # upcast attention to fp32
+        attn_weights = self.softmax(attn_weights).to(query_states.dtype)
+        attn_output = self.gemm2(attn_weights, value_states)
 
-            # upcast attention to fp32
-            attn_weights = self.softmax(attn_weights).to(query_states.dtype)
-            attn_output = self.gemm2(attn_weights, value_states)
-
-            if attn_output.size() != (bsz, self.num_heads, q_len, self.head_dim):
-                raise ValueError(
-                    f"`attn_output` should be of size {(bsz, self.num_heads, q_len, self.head_dim)}, but is"
-                    f" {attn_output.size()}"
-                )
+        if attn_output.size() != (bsz, self.num_heads, q_len, self.head_dim):
+            raise ValueError(
+                f"`attn_output` should be of size {(bsz, self.num_heads, q_len, self.head_dim)}, but is"
+                f" {attn_output.size()}"
+            )
 
         attn_output = attn_output.transpose(1, 2).contiguous()
         attn_output = attn_output.reshape(bsz, q_len, self.hidden_size)
@@ -649,10 +616,6 @@ class MistralDecoderLayer(nn.Module):
         self.post_attention_layernorm = MistralRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         
         self.use_full_layer = False
-        self.full_layer = MixedSparseSingleLayerWithGate(
-            hidden_dim=config.hidden_size,
-            num_heads=config.num_attention_heads,
-        )
 
     def forward(
         self,
@@ -681,84 +644,32 @@ class MistralDecoderLayer(nn.Module):
                 (see `past_key_values`).
             past_key_value (`Tuple(torch.FloatTensor)`, *optional*): cached past key and value projection states
         """
-        if self.use_full_layer and self.training:
-            # generate cos & sin firstly
-            cos, sin = self.self_attn.rotary_emb.forward(hidden_states, seq_len=hidden_states.size(1))
-            outputs = self.full_layer.forward(
-                input=hidden_states,
-                norm_weight_1=self.input_layernorm.weight,
-                norm_bias_1=None,
-                cos=cos,
-                sin=sin,
-                position_ids=position_ids,
-                q_proj_base=self.self_attn.q_proj.base_layer,
-                q_proj_lora_a=self.self_attn.q_proj.lora_A,
-                q_proj_lora_b=self.self_attn.q_proj.lora_B,
-                k_proj_base=self.self_attn.k_proj.base_layer,
-                k_proj_lora_a=self.self_attn.k_proj.lora_A,
-                k_proj_lora_b=self.self_attn.k_proj.lora_B,
-                v_proj_base=self.self_attn.v_proj.base_layer,
-                v_proj_lora_a=self.self_attn.v_proj.lora_A,
-                v_proj_lora_b=self.self_attn.v_proj.lora_B,
-                o_proj_base=self.self_attn.o_proj.base_layer,
-                o_proj_lora_a=self.self_attn.o_proj.lora_A,
-                o_proj_lora_b=self.self_attn.o_proj.lora_B,
-                #############################################
-                norm_weight_2=self.post_attention_layernorm.weight,
-                norm_bias_2=None,
-                gate_proj_base=self.mlp.gate_proj.base_layer,
-                gate_proj_lora_a=self.mlp.gate_proj.lora_A,
-                gate_proj_lora_b=self.mlp.gate_proj.lora_B,
-                up_proj_base=self.mlp.up_proj.base_layer,
-                up_proj_lora_a=self.mlp.up_proj.lora_A,
-                up_proj_lora_b=self.mlp.up_proj.lora_B,
-                down_proj_base=self.mlp.down_proj.base_layer,
-                down_proj_lora_a=self.mlp.down_proj.lora_A,
-                down_proj_lora_b=self.mlp.down_proj.lora_B,
-                #############################################
-                attention_mask=attention_mask,
-                norm_mode='rmsnorm',
-                num_heads=self.self_attn.num_heads,
-                head_dim=self.self_attn.head_dim,
-                use_rotary_pos_enc=True,
-                small_value_approx=False,
-                activation_forward='silu',
-                activation_backward='silu',
-                #############################################
-                prune=True,
-                prune_ratio=0.9,
-                shrink_head_ratio=4,
-                #############################################
-                training=self.training
-            )
-            outputs = (outputs,)
-        else:
-            residual = hidden_states
-            hidden_states = self.input_layernorm(hidden_states)
-            # Self Attention
-            hidden_states, self_attn_weights, present_key_value = self.self_attn(
-                hidden_states=hidden_states,
-                attention_mask=attention_mask,
-                position_ids=position_ids,
-                past_key_value=past_key_value,
-                output_attentions=output_attentions,
-                use_cache=use_cache,
-            )
-            hidden_states = residual + hidden_states
+        residual = hidden_states
+        hidden_states = self.input_layernorm(hidden_states)
+        # Self Attention
+        hidden_states, self_attn_weights, present_key_value = self.self_attn(
+            hidden_states=hidden_states,
+            attention_mask=attention_mask,
+            position_ids=position_ids,
+            past_key_value=past_key_value,
+            output_attentions=output_attentions,
+            use_cache=use_cache,
+        )
+        hidden_states = residual + hidden_states
 
-            # Fully Connected
-            residual = hidden_states
-            hidden_states = self.post_attention_layernorm(hidden_states)
-            hidden_states = self.mlp(hidden_states)
-            hidden_states = residual + hidden_states
+        # Fully Connected
+        residual = hidden_states
+        hidden_states = self.post_attention_layernorm(hidden_states)
+        hidden_states = self.mlp(hidden_states)
+        hidden_states = residual + hidden_states
 
-            outputs = (hidden_states,)
+        outputs = (hidden_states,)
 
-            if output_attentions:
-                outputs += (self_attn_weights,)
+        if output_attentions:
+            outputs += (self_attn_weights,)
 
-            if use_cache:
-                outputs += (present_key_value,)
+        if use_cache:
+            outputs += (present_key_value,)
 
         return outputs
 
