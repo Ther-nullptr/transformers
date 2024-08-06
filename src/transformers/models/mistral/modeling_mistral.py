@@ -194,6 +194,11 @@ class MistralMLP(nn.Module):
         hadamard = self.hadamard(gate, up)
         result = self.down_proj(hadamard)
         return result
+    
+    @staticmethod
+    def forward_compute(self, x):
+        down_proj = self.down_proj(self.hadamard(self.act_fn(self.gate_proj(x)), self.up_proj(x)))
+        return down_proj
 
 
 # Copied from transformers.models.llama.modeling_llama.repeat_kv
@@ -250,6 +255,13 @@ class MistralAttention(nn.Module):
 
     def _shape(self, tensor: torch.Tensor, seq_len: int, bsz: int):
         return tensor.view(bsz, seq_len, self.num_heads, self.head_dim).transpose(1, 2).contiguous()
+    
+    @staticmethod
+    def apply_qkv(self, hidden_states):
+        query_states = self.q_proj(hidden_states)
+        key_states = self.k_proj(hidden_states)
+        value_states = self.v_proj(hidden_states)
+        return query_states, key_states, value_states
 
     def forward(
         self,
@@ -660,7 +672,7 @@ class MistralDecoderLayer(nn.Module):
         # Fully Connected
         residual = hidden_states
         hidden_states = self.post_attention_layernorm(hidden_states)
-        hidden_states = self.mlp(hidden_states)
+        hidden_states = self.mlp.forward_compute(self.mlp, hidden_states)
         hidden_states = residual + hidden_states
 
         outputs = (hidden_states,)
