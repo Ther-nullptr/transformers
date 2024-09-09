@@ -45,11 +45,38 @@ from ...utils import (
 )
 from .configuration_roberta import RobertaConfig
 
+from flash_attn import flash_attn_func, flash_attn_varlen_func
+from flash_attn.bert_padding import index_first_axis, index_put_first_axis
+
+import torch.nn.functional as F
+from einops import rearrange
 
 logger = logging.get_logger(__name__)
 
 _CHECKPOINT_FOR_DOC = "FacebookAI/roberta-base"
 _CONFIG_FOR_DOC = "RobertaConfig"
+
+
+def pad_input(hidden_states, indices, batch, seqlen):
+    dim = hidden_states.shape[-1]
+    output = index_put_first_axis(hidden_states, indices, batch * seqlen)
+    return rearrange(output, "(b s) ... -> b s ...", b=batch)
+
+
+def unpad_input(hidden_states, attention_mask):
+    attention_mask = ~attention_mask.bool()
+    seqlens_in_batch = attention_mask.sum(dim=-1, dtype=torch.int32)
+    indices = torch.nonzero(attention_mask.flatten(), as_tuple=False).flatten()
+    max_seqlen_in_batch = seqlens_in_batch.max().item()
+    cu_seqlens = F.pad(torch.cumsum(seqlens_in_batch, dim=0, dtype=torch.int32), (0, 0, 0, 0, 1, 0))
+    cu_seqlens = cu_seqlens.squeeze()
+
+    return (
+        index_first_axis(rearrange(hidden_states, "b s ... -> (b s) ..."), indices),
+        indices,
+        cu_seqlens,
+        max_seqlen_in_batch,
+    )
 
 
 class RobertaGEMM(nn.Module):
@@ -58,6 +85,20 @@ class RobertaGEMM(nn.Module):
         
     def forward(self, x1, x2):
         return x1 @ x2
+    
+    
+class RobertaFlashAttentionInternal(nn.Module):
+    def __init__(self):
+        super().__init__()
+        
+    def forward(self, q, k, v, attn_mask, casual = False):
+        batch, seq_len, num_heads, head_dim = q.shape
+        query_layer, indices_q, cu_seqlens_q, max_seqlen_q = unpad_input(q, attn_mask)
+        key_layer, indices_k, cu_seqlens_k, max_seqlen_k = unpad_input(k, attn_mask)
+        value_layer, indices_v, cu_seqlens_v, max_seqlen_v = unpad_input(v, attn_mask)
+        out = flash_attn_varlen_func(query_layer, key_layer, value_layer, cu_seqlens_q = cu_seqlens_q, cu_seqlens_k = cu_seqlens_k, max_seqlen_q = max_seqlen_q, max_seqlen_k = max_seqlen_k, casual = casual)
+        out = pad_input(out, indices_q, batch, seq_len)
+        return out
 
 
 class RobertaEmbeddings(nn.Module):
@@ -237,7 +278,6 @@ class RobertaSelfAttention(nn.Module):
 
         # Take the dot product between "query" and "key" to get the raw attention scores.
         attention_scores = self.gemm1(query_layer, key_layer.transpose(-1, -2))
-
         if self.position_embedding_type == "relative_key" or self.position_embedding_type == "relative_key_query":
             query_length, key_length = query_layer.shape[2], key_layer.shape[2]
             if use_cache:
@@ -287,6 +327,70 @@ class RobertaSelfAttention(nn.Module):
         if self.is_decoder:
             outputs = outputs + (past_key_value,)
         return outputs
+    
+    
+class RobertaFlashAttention(nn.Module):
+    def __init__(self, config, position_embedding_type=None):
+        super().__init__()
+        if config.hidden_size % config.num_attention_heads != 0 and not hasattr(config, "embedding_size"):
+            raise ValueError(
+                f"The hidden size ({config.hidden_size}) is not a multiple of the number of attention "
+                f"heads ({config.num_attention_heads})"
+            )
+
+        self.num_attention_heads = config.num_attention_heads
+        self.attention_head_size = int(config.hidden_size / config.num_attention_heads)
+        self.all_head_size = self.num_attention_heads * self.attention_head_size
+
+        self.query = nn.Linear(config.hidden_size, self.all_head_size)
+        self.key = nn.Linear(config.hidden_size, self.all_head_size)
+        self.value = nn.Linear(config.hidden_size, self.all_head_size)
+
+        self.dropout = nn.Dropout(config.attention_probs_dropout_prob)
+        self.position_embedding_type = position_embedding_type or getattr(
+            config, "position_embedding_type", "absolute"
+        )
+        if self.position_embedding_type == "relative_key" or self.position_embedding_type == "relative_key_query":
+            self.max_position_embeddings = config.max_position_embeddings
+            self.distance_embedding = nn.Embedding(2 * config.max_position_embeddings - 1, self.attention_head_size)
+
+        self.is_decoder = config.is_decoder
+        self.flash_attn = RobertaFlashAttentionInternal()
+
+    def transpose_for_scores(self, x: torch.Tensor) -> torch.Tensor:
+        new_x_shape = x.size()[:-1] + (self.num_attention_heads, self.attention_head_size)
+        x = x.view(new_x_shape)
+        return x.permute(0, 2, 1, 3)
+
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        attention_mask: Optional[torch.FloatTensor] = None,
+        head_mask: Optional[torch.FloatTensor] = None,
+        encoder_hidden_states: Optional[torch.FloatTensor] = None,
+        encoder_attention_mask: Optional[torch.FloatTensor] = None,
+        past_key_value: Optional[Tuple[Tuple[torch.FloatTensor]]] = None,
+        output_attentions: Optional[bool] = False,
+    ) -> Tuple[torch.Tensor]:
+        mixed_query_layer = self.query(hidden_states)
+        key_layer = self.transpose_for_scores(self.key(hidden_states))
+        value_layer = self.transpose_for_scores(self.value(hidden_states))
+        query_layer = self.transpose_for_scores(mixed_query_layer)
+        if self.is_decoder:
+            past_key_value = (key_layer, value_layer)
+
+        # (batch, num_heads, seq_len, head_dim) -> (batch, seq_len, num_heads, head_dim)
+        batch, num_heads, seq_len, head_dim = query_layer.shape
+        query_layer, key_layer, value_layer = query_layer.transpose(1, 2).to(torch.bfloat16), key_layer.transpose(1, 2).to(torch.bfloat16), value_layer.transpose(1, 2).to(torch.bfloat16)
+        context_layer, indices_q = self.flash_attn(query_layer, key_layer, value_layer, attention_mask, False)
+        context_layer = pad_input(context_layer, indices_q, batch, seq_len)
+        context_layer = rearrange(context_layer, "b s hn hd -> b s (hn hd)")
+
+        outputs = (context_layer,)
+
+        if self.is_decoder:
+            outputs = outputs + (past_key_value,)
+        return outputs
 
 
 # Copied from transformers.models.bert.modeling_bert.BertSelfOutput
@@ -306,6 +410,7 @@ class RobertaSelfOutput(nn.Module):
 
 ROBERTA_SELF_ATTENTION_CLASSES = {
     "eager": RobertaSelfAttention,
+    "flash": RobertaFlashAttention,
 }
 
 

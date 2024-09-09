@@ -2533,7 +2533,7 @@ class Trainer:
                 if os.path.exists(resume_from_checkpoint):
                     # For BC for older PEFT versions
                     if hasattr(model, "active_adapters"):
-                        active_adapters = model.active_adapters()
+                        active_adapters = model.active_adapters
                         if len(active_adapters) > 1:
                             logger.warning("Multiple active adapters detected will only consider the first adapter")
                         active_adapter = active_adapters[0]
