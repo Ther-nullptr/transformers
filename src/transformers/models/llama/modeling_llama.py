@@ -50,6 +50,7 @@ from ...utils import (
 from ...utils.import_utils import is_torch_fx_available
 from .configuration_llama import LlamaConfig
 
+from .layer2_quant_baseline import FusedLlamaLayer
 
 if is_flash_attn_2_available():
     from flash_attn import flash_attn_func, flash_attn_varlen_func
@@ -776,14 +777,71 @@ class LlamaDecoderLayer(nn.Module):
     def __init__(self, config: LlamaConfig, layer_idx: int):
         super().__init__()
         self.hidden_size = config.hidden_size
-
-        self.self_attn = LLAMA_ATTENTION_CLASSES[config._attn_implementation](config=config, layer_idx=layer_idx)
+        self.num_attention_heads = config.num_attention_heads
+        self.self_attn = LlamaAttention(config=config, layer_idx=layer_idx)
 
         self.mlp = LlamaMLP(config)
         self.input_layernorm = LlamaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.post_attention_layernorm = LlamaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-
+        
+        self.fused_llama_layer = FusedLlamaLayer(config.hidden_size, config.num_attention_heads)
+        
     def forward(
+        self,
+        hidden_states: torch.Tensor,
+        attention_mask: Optional[torch.Tensor] = None,
+        position_ids: Optional[torch.LongTensor] = None,
+        past_key_value: Optional[Tuple[torch.Tensor]] = None,
+        output_attentions: Optional[bool] = False,
+        use_cache: Optional[bool] = False,
+        **kwargs,
+    ) -> Tuple[torch.FloatTensor, Optional[Tuple[torch.FloatTensor, torch.FloatTensor]]]:
+        if False:
+            batch, seq_len, _ = hidden_states.shape
+            hidden_states_fake = hidden_states.view(batch, self.num_attention_heads, seq_len, self.hidden_size // self.num_attention_heads)
+            cos, sin = self.self_attn.rotary_emb.forward(hidden_states_fake, seq_len)
+            del hidden_states_fake
+            
+            outputs = self.fused_llama_layer.forward(
+                hidden_states,
+                self.input_layernorm.weight,
+                None,
+                cos,
+                sin,
+                self.self_attn.q_proj.base_layer,
+                self.self_attn.q_proj.lora_A,
+                self.self_attn.q_proj.lora_B,
+                self.self_attn.k_proj.base_layer,
+                self.self_attn.k_proj.lora_A,
+                self.self_attn.k_proj.lora_B,
+                self.self_attn.v_proj.base_layer,
+                self.self_attn.v_proj.lora_A,
+                self.self_attn.v_proj.lora_B,
+                self.self_attn.o_proj.base_layer,
+                self.self_attn.o_proj.lora_A,
+                self.self_attn.o_proj.lora_B,
+                self.post_attention_layernorm.weight,
+                None,
+                self.mlp.gate_proj.base_layer,
+                self.mlp.gate_proj.lora_A,
+                self.mlp.gate_proj.lora_B,
+                self.mlp.up_proj.base_layer,
+                self.mlp.up_proj.lora_A,
+                self.mlp.up_proj.lora_B,
+                self.mlp.down_proj.base_layer,
+                self.mlp.down_proj.lora_A,
+                self.mlp.down_proj.lora_B,
+                attention_mask,
+                self.num_attention_heads,
+                self.hidden_size // self.num_attention_heads,
+            )
+            return (outputs, )
+        
+        else:
+            return self.forward_old(hidden_states, attention_mask, position_ids, past_key_value, output_attentions, use_cache, **kwargs)
+
+
+    def forward_old(
         self,
         hidden_states: torch.Tensor,
         attention_mask: Optional[torch.Tensor] = None,
@@ -1006,6 +1064,8 @@ class LlamaModel(LlamaPreTrainedModel):
         output_hidden_states: Optional[bool] = None,
         return_dict: Optional[bool] = None,
     ) -> Union[Tuple, BaseModelOutputWithPast]:
+        if self.training:
+            use_cache = False
         output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
         output_hidden_states = (
             output_hidden_states if output_hidden_states is not None else self.config.output_hidden_states
@@ -1220,7 +1280,7 @@ class LlamaForCausalLM(LlamaPreTrainedModel):
             logits = [F.linear(hidden_states, lm_head_slices[i]) for i in range(self.config.pretraining_tp)]
             logits = torch.cat(logits, dim=-1)
         else:
-            logits = self.lm_head(hidden_states)
+            logits = self.lm_head(hidden_states.to(self.lm_head.weight.dtype))
         logits = logits.float()
 
         loss = None
