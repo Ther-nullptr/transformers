@@ -51,7 +51,7 @@ from ...utils.import_utils import is_torch_fx_available
 from .configuration_llama import LlamaConfig
 
 
-if is_flash_attn_2_available():
+if False:
     from flash_attn import flash_attn_func, flash_attn_varlen_func
     from flash_attn.bert_padding import index_first_axis, pad_input, unpad_input  # noqa
 
@@ -106,7 +106,7 @@ class LlamaHadamard(nn.Module):
 
     def forward(self, x1, x2):
         return x1 * x2
-    
+
 
 class LlamaGEMM(nn.Module):
     def __init__(self, attention_first = False):
@@ -120,7 +120,7 @@ class LlamaGEMM(nn.Module):
 class LlamaFlashAttention(nn.Module):
     def __init__(self):
         super().__init__()
-        
+
     def forward(self):
         return None
 
@@ -346,7 +346,7 @@ class LlamaAttention(nn.Module):
         self.softmax = nn.Softmax(dim=-1)
         self.gemm1 = LlamaGEMM(attention_first=False)
         self.gemm2 = LlamaGEMM(attention_first=True)
-        
+
         self.flash_attention = LlamaFlashAttention() #! just a place holder, finally it will be replaced by the actual flash attention module
 
     def _init_rope(self):
