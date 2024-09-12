@@ -1,0 +1,708 @@
+import math
+import torch
+import typing
+import bitsandbytes as bnb
+import torch.nn.functional as F
+import bitsandbytes.functional as BF
+
+from .rmsnorm_kernels import rmsnorm_forward, rmsnorm_backward
+from .softmax_kernels import softmax_backward
+from .rope_kernels import calculate_settings, rope_forward, rope_backward
+from .silu_kernels import silu_backward
+
+
+def hidden_to_head_shape(x: torch.Tensor, num_heads: int):
+    bsz, seq_len, hidden_dim = x.shape
+    head_dim = hidden_dim // num_heads
+    return x.reshape(bsz, seq_len, num_heads, head_dim).transpose(1, 2)
+
+
+def head_to_hidden_shape(x: torch.Tensor):
+    bsz, num_heads, seq_len, head_dim = x.shape
+    return x.transpose(1, 2).reshape(bsz, seq_len, -1)
+
+
+def lora_forward(w, w_quant_state, w_lora_a, w_lora_b, b, x):
+    w_dequant = BF.dequantize_nf4(w, w_quant_state).t()
+    x = x.to(w_dequant.dtype)
+    x_main = x @ w_dequant + b.to(w_dequant.dtype) if b is not None else x @ w_dequant
+    x_lora_a = x @ w_lora_a.to(w_dequant.dtype)
+    x_lora = x_lora_a @ w_lora_b.to(w_dequant.dtype)
+    x = x_main + x_lora
+    return x, x_main, x_lora_a
+
+
+def lora_backward(w, w_quant_state, w_lora_a, w_lora_b, x, x_lora_a, grad_y):
+    w_dequant = BF.dequantize_nf4(w, w_quant_state).t()
+    w_lora_a, w_lora_b = w_lora_a.to(w_dequant.dtype), w_lora_b.to(w_dequant.dtype)
+    grad_w_lora_a = x.to(w_dequant.dtype).mT @ (grad_y.to(w_dequant.dtype) @ w_lora_b.mT)
+    grad_w_lora_b = x_lora_a.mT @ grad_y.to(w_lora_b.dtype)
+    grad_x = grad_y.to(w_dequant.dtype) @ w_dequant.T 
+    grad_x += (grad_y.to(w_lora_b.dtype) @ w_lora_b.T @ w_lora_a.T)
+    return grad_w_lora_a, grad_w_lora_b, grad_x
+
+
+def repeat_kv(hidden_states: torch.Tensor, n_rep: int) -> torch.Tensor:
+    """
+    This is the equivalent of torch.repeat_interleave(x, dim=1, repeats=n_rep). The hidden states go from (batch,
+    num_key_value_heads, seqlen, head_dim) to (batch, num_attention_heads, seqlen, head_dim)
+    """
+    batch, num_key_value_heads, slen, head_dim = hidden_states.shape
+    if n_rep == 1:
+        return hidden_states
+    hidden_states = hidden_states[:, :, None, :, :].expand(batch, num_key_value_heads, n_rep, slen, head_dim)
+    return hidden_states.reshape(batch, num_key_value_heads * n_rep, slen, head_dim)
+
+
+class FusedLlamaLayerFunc(torch.autograd.Function):
+    @staticmethod
+    def forward(
+        ctx,
+        x: torch.Tensor,
+        #############attention part#############
+        norm_weight_1: torch.Tensor,
+        norm_bias_1: torch.Tensor,
+        ####################################
+        cos: torch.Tensor,
+        sin: torch.Tensor,
+        ####################################
+        w_q: torch.Tensor,
+        b_q: torch.Tensor,
+        w_q_quant_state: typing.Tuple,
+        w_q_lora_a: torch.Tensor,
+        w_q_lora_b: torch.Tensor,
+        ####################################
+        w_k: torch.Tensor,
+        b_k: torch.Tensor,
+        w_k_quant_state: typing.Tuple,
+        w_k_lora_a: torch.Tensor,
+        w_k_lora_b: torch.Tensor,
+        ####################################
+        w_v: torch.Tensor,
+        b_v: torch.Tensor,
+        w_v_quant_state: typing.Tuple,
+        w_v_lora_a: torch.Tensor,
+        w_v_lora_b: torch.Tensor,
+        ####################################
+        w_o: torch.Tensor,
+        b_o: torch.Tensor,
+        w_o_quant_state: typing.Tuple,
+        w_o_lora_a: torch.Tensor,
+        w_o_lora_b: torch.Tensor,
+        #############mlp part#############
+        norm_weight_2: torch.Tensor,
+        norm_bias_2: torch.Tensor,
+        ####################################
+        w_gate: torch.Tensor,
+        b_gate: torch.Tensor,
+        w_gate_quant_state: typing.Tuple,
+        w_gate_lora_a: torch.Tensor,
+        w_gate_lora_b: torch.Tensor,
+        ####################################
+        w_up: torch.Tensor,
+        b_up: torch.Tensor,
+        w_up_quant_state: typing.Tuple,
+        w_up_lora_a: torch.Tensor,
+        w_up_lora_b: torch.Tensor,
+        ####################################
+        w_down: torch.Tensor,
+        b_down: torch.Tensor,
+        w_down_quant_state: typing.Tuple,
+        w_down_lora_a: torch.Tensor,
+        w_down_lora_b: torch.Tensor,
+        ###############other################
+        attention_mask: torch.Tensor,
+        num_heads: int,
+        head_dim: int,
+        ###############about statistics################
+        compress: bool,
+        iteration: int,
+        iteration_threshold: int,
+        static_value: dict
+    ):
+        # layernorm or rmsnorm
+        x_norm_1, mean_1, rstd_1, _, _ = rmsnorm_forward(x, norm_weight_1, eps = 1e-5)
+        
+        #* compress the (copy of) x
+        x_copy = x.clone()
+        if compress:
+            x_o, x_q, x_channel_idx, scale = compress_pack_channel_base(
+                x=x_copy, o_ratio=0.005, q_bit=4,
+                q_method='per-channel', it_num=iteration,
+                it_num_thd=iteration_threshold, static_value=static_value['x']
+            )
+
+        # compute q,k,v
+        # forward process: q_proj
+        q, q_main, q_lora_a = lora_forward(w_q, w_q_quant_state, w_q_lora_a, w_q_lora_b, b_q, x_norm_1)
+
+        # forward process: k_proj
+        k, k_main, k_lora_a = lora_forward(w_k, w_k_quant_state, w_k_lora_a, w_k_lora_b, b_k, x_norm_1)
+
+        # forward process: v_proj
+        v, v_main, v_lora_a = lora_forward(w_v, w_v_quant_state, w_v_lora_a, w_v_lora_b, b_v, x_norm_1)
+        
+        #* compress x_norm_1
+        if compress:
+            x_norm_1_q, x_norm_1_scale = compress_pack_quant_base(
+                x=x_norm_1, q_bit=4,
+                q_method='per-channel', it_num=iteration,
+                it_num_thd=iteration_threshold, static_value=static_value['x_norm_1']
+            )
+        
+        # reshape
+        q = hidden_to_head_shape(q, num_heads)
+        k = hidden_to_head_shape(k, num_heads)
+        v = hidden_to_head_shape(v, num_heads)
+        
+        ctx.q_shape = q.shape
+
+        # TODO: apply positional encoding
+        q = rope_forward(q.transpose(1, 2), cos, sin).transpose(1, 2)
+        k = rope_forward(k.transpose(1, 2), cos, sin).transpose(1, 2)
+
+        # q,k,v: [bsz, num_heads, q_len, head_dim]
+        # notice forward process no need to drop heads
+        bsz, num_heads, q_len, head_dim = q.shape
+
+        # forward: S = Q @ K.T / sqrt(d_k)
+        s = q @ k.transpose(-2, -1) / math.sqrt(head_dim)
+        
+        #* compress q, k
+        if compress:
+            q_q, q_scale = compress_pack_quant_base(
+                x=q, q_bit=4,
+                q_method='per-channel', it_num=iteration,
+                it_num_thd=iteration_threshold, static_value=static_value['q']
+            )
+            k_q, k_scale = compress_pack_quant_base(
+                x=k, q_bit=4,
+                q_method='per-channel', it_num=iteration,
+                it_num_thd=iteration_threshold, static_value=static_value['k']
+            )
+        
+        # apply mask
+        if attention_mask is not None:
+            s = s + attention_mask
+
+        # forward: softmax
+        a = torch.softmax(s, dim=-1, dtype=v.dtype)  # [bsz, num_heads, q_len, q_len]
+        
+        #* compress a
+        if compress:
+            a_o, a_threshold = compress_pack_softmax_base(
+                x=a, o_ratio=0.005, it_num=iteration,
+                it_num_thd=iteration_threshold, static_value=static_value['a']
+            )
+
+        # forward: O = A @ V
+        o = a @ v
+        
+        #* compress v
+        if compress:
+            v_o, v_q, v_channel_idx, v_scale = compress_pack_quant_base(
+                x=v, q_bit=4,
+                q_method='per-channel', it_num=iteration,
+                it_num_thd=iteration_threshold, static_value=static_value['v']
+            )
+        
+        # reshape
+        o = head_to_hidden_shape(o)
+
+        # forward process: o_proj
+        o_final, o_final_main, o_final_lora_a = lora_forward(w_o, w_o_quant_state, w_o_lora_a, w_o_lora_b, b_o, o)
+        
+        #* compress o
+        if compress:
+            o_o, o_q, o_channel_idx, o_scale = compress_pack_quant_base(
+                x=o, q_bit=4,
+                q_method='per-channel', it_num=iteration,
+                it_num_thd=iteration_threshold, static_value=static_value['o']
+            )
+        
+        # residual connection
+        x_medium = x + o_final
+        
+        # layernorm or rmsnorm
+        x_norm_2, mean_2, rstd_2, block_size, num_warps = rmsnorm_forward(x_medium, norm_weight_2, eps = 1e-5)
+        
+        #* compress the (copy of) x_medium
+        x_medium_copy = x_medium.clone()
+        if compress:
+            x_medium_o, x_medium_q, x_medium_channel_idx, x_medium_scale = compress_pack_channel_base(
+                x=x_medium_copy, o_ratio=0.005, q_bit=4,
+                q_method='per-channel', it_num=iteration,
+                it_num_thd=iteration_threshold, static_value=static_value['x_medium']
+            )
+        
+        # forward process: gate_proj
+        gate, gate_main, gate_lora_a = lora_forward(w_gate, w_gate_quant_state, w_gate_lora_a, w_gate_lora_b, b_gate, x_norm_2)
+        
+        # forward process: up_proj
+        up, up_main, up_lora_a = lora_forward(w_up, w_up_quant_state, w_up_lora_a, w_up_lora_b, b_up, x_norm_2)
+
+        #* compress the x_norm_2
+        if compress:
+            x_norm_2_o, x_norm_2_q, x_norm_2_channel_idx, x_norm_2_scale = compress_pack_quant_base(
+                x=x_norm_2, q_bit=4,
+                q_method='per-channel', it_num=iteration,
+                it_num_thd=iteration_threshold, static_value=static_value['x_norm_2']
+            )
+        
+        # apply activation function (for gate)
+        fn = torch.nn.functional.silu(gate)
+        
+        #* compress the gate
+        if compress:
+            gate_o, gate_q, gate_channel_idx, gate_scale = compress_pack_quant_base(
+                x=gate, o_ratio=0.005, q_bit=4,
+                q_method='per-channel', it_num=iteration,
+                it_num_thd=iteration_threshold, static_value=static_value['gate']
+            )
+            
+        # hadamard
+        hadamard = up * fn
+        
+        #* compress the up / fn
+        if compress:
+            up_o, up_q, up_channel_idx, up_scale = compress_pack_quant_base(
+                x=up, q_bit=4,
+                q_method='per-channel', it_num=iteration,
+                it_num_thd=iteration_threshold, static_value=static_value['up']
+            )
+            fn_o, fn_q, fn_channel_idx, fn_scale = compress_pack_quant_base(
+                x=fn, q_bit=4,
+                q_method='per-channel', it_num=iteration,
+                it_num_thd=iteration_threshold, static_value=static_value['fn']
+            )
+            
+        # forward process: down_proj
+        down, down_main, down_lora_a = lora_forward(w_down, w_down_quant_state, w_down_lora_a, w_down_lora_b, b_down, hadamard)
+        
+        #* compress the hadamard
+        if compress:
+            hadamard_o, hadamard_q, hadamard_channel_idx, hadamard_scale = compress_pack_quant_base(
+                x=hadamard, q_bit=4,
+                q_method='per-channel', it_num=iteration,
+                it_num_thd=iteration_threshold, static_value=static_value['hadamard']
+            )
+        
+        # residual connection
+        x_out = x_medium + down
+        
+        if compress:
+            ctx.save_for_backward(
+                
+            )
+        else:
+            ctx.save_for_backward(
+                ### activations (attention) ###
+                x, # buffer for rmsnorm
+                mean_1, # buffer for rmsnorm
+                rstd_1, # buffer for rmsnorm
+                x_norm_1, # buffer for lora (qkv)
+                q_lora_a, # buffer for lora (qkv)
+                k_lora_a, # buffer for lora (qkv)
+                v_lora_a, # buffer for lora (qkv)
+                cos, # buffer for rope
+                sin, # buffer for rope
+                q, # buffer for attn
+                k, # buffer for attn
+                v, # buffer for attn
+                a, # buffer for attn
+                o, # buffer for o
+                o_final_lora_a, # buffer for lora (o)
+                ### activations (mlp) ###
+                x_medium, # buffer for rmsnorm
+                mean_2, # buffer for rmsnorm
+                rstd_2, # buffer for rmsnorm
+                x_norm_2, # buffer for lora (gate/up)
+                gate_lora_a, # buffer for lora (gate)
+                gate, # buffer for gelu/silu
+                up_lora_a, # buffer for lora (up)
+                up, # buffer for hadamard
+                fn, # buffer for hadamard
+                hadamard, # buffer for down
+                down_lora_a, # buffer for lora (down)
+                ### weights (attention) ###
+                norm_weight_1, 
+                norm_bias_1,
+                w_q,
+                b_q,
+                w_q_lora_a,
+                w_q_lora_b,
+                #**********************
+                w_k,
+                b_k,
+                w_k_lora_a,
+                w_k_lora_b,
+                #**********************
+                w_v,
+                b_v,
+                w_v_lora_a,
+                w_v_lora_b,
+                #**********************
+                w_o,
+                b_o,
+                w_o_lora_a,
+                w_o_lora_b,
+                ### weights (mlp) ###
+                norm_weight_2,
+                norm_bias_2,
+                #**********************
+                w_gate,
+                b_gate,
+                w_gate_lora_a,
+                w_gate_lora_b,
+                #**********************
+                w_up,
+                b_up,
+                w_up_lora_a,
+                w_up_lora_b,
+                #**********************
+                w_down,
+                b_down,
+                w_down_lora_a,
+                w_down_lora_b,
+            )
+        ctx.quant_state = (
+            w_q_quant_state,
+            w_k_quant_state,
+            w_v_quant_state,
+            w_o_quant_state,
+            w_gate_quant_state,
+            w_up_quant_state,
+            w_down_quant_state,
+        )
+        ctx.num_heads = num_heads
+        ctx.block_size = block_size
+        ctx.num_warps = num_warps
+        ctx.head_dim = head_dim
+
+        return x_out
+    
+    @staticmethod
+    def backward(ctx, grad_output: torch.Tensor):
+        (
+            w_q_quant_state,
+            w_k_quant_state,
+            w_v_quant_state,
+            w_o_quant_state,
+            w_gate_quant_state,
+            w_up_quant_state,
+            w_down_quant_state,
+        ) = ctx.quant_state
+        
+        (
+            ### activations (attention) ###
+            x, # buffer for rmsnorm
+            mean_1, # buffer for rmsnorm
+            rstd_1, # buffer for rmsnorm
+            x_norm_1, # buffer for lora (qkv)
+            q_lora_a, # buffer for lora (qkv)
+            k_lora_a, # buffer for lora (qkv)
+            v_lora_a, # buffer for lora (qkv)
+            cos, # buffer for rope
+            sin, # buffer for rope
+            q, # buffer for attn
+            k, # buffer for attn
+            v, # buffer for attn
+            a, # buffer for attn
+            o, # buffer for o
+            o_final_lora_a, # buffer for lora (o)
+            ### activations (mlp) ###
+            x_medium, # buffer for rmsnorm
+            mean_2, # buffer for rmsnorm
+            rstd_2, # buffer for rmsnorm
+            x_norm_2, # buffer for lora (gate/up)
+            gate_lora_a, # buffer for lora (gate)
+            gate, # buffer for gelu/silu
+            up_lora_a, # buffer for lora (up)
+            up, # buffer for hadamard
+            fn, # buffer for hadamard
+            hadamard, # buffer for down
+            down_lora_a, # buffer for lora (down)
+            ### weights (attention) ###
+            norm_weight_1, 
+            norm_bias_1,
+            w_q,
+            b_q,
+            w_q_lora_a,
+            w_q_lora_b,
+            #**********************
+            w_k,
+            b_k,
+            w_k_lora_a,
+            w_k_lora_b,
+            #**********************
+            w_v,
+            b_v,
+            w_v_lora_a,
+            w_v_lora_b,
+            #**********************
+            w_o,
+            b_o,
+            w_o_lora_a,
+            w_o_lora_b,
+            ### weights (mlp) ###
+            norm_weight_2,
+            norm_bias_2,
+            #**********************
+            w_gate,
+            b_gate,
+            w_gate_lora_a,
+            w_gate_lora_b,
+            #**********************
+            w_up,
+            b_up,
+            w_up_lora_a,
+            w_up_lora_b,
+            #**********************
+            w_down,
+            b_down,
+            w_down_lora_a,
+            w_down_lora_b,
+        ) = ctx.saved_tensors
+        
+        # down proj part
+        grad_w_down_lora_a, grad_w_down_lora_b, grad_down = lora_backward(w_down, w_down_quant_state, w_down_lora_a, w_down_lora_b, hadamard, down_lora_a, grad_output)
+        
+        # hadamard
+        grad_hadamard_1 = grad_down * up
+        grad_hadamard_2 = grad_down * fn
+        
+        # TODO: activation backward
+        grad_fn = silu_backward(gate, grad_hadamard_1)
+        
+        # gate proj part
+        grad_w_gate_lora_a, grad_w_gate_lora_b, grad_gate = lora_backward(w_gate, w_gate_quant_state, w_gate_lora_a, w_gate_lora_b, x_norm_2, gate_lora_a, grad_fn)
+        
+        # up proj part
+        grad_w_up_lora_a, grad_w_up_lora_b, grad_up = lora_backward(w_up, w_up_quant_state, w_up_lora_a, w_up_lora_b, x_norm_2, up_lora_a, grad_hadamard_2)
+        grad_gate_up = grad_up + grad_gate
+        
+        # layernorm & rmsnorm backward
+        grad_norm_2, _ = rmsnorm_backward(
+            grad_gate_up, x_medium, norm_weight_2, mean_2, rstd_2, # TODO: other params
+            True, 1e-5, ctx.num_warps, ctx.block_size
+        )
+        
+        # residual connection
+        grad_medium = grad_norm_2 + grad_output
+        
+        # o part
+        grad_w_o_lora_a, grad_w_o_lora_b, grad_o = lora_backward(w_o, w_o_quant_state, w_o_lora_a, w_o_lora_b, o, o_final_lora_a, grad_medium)
+        
+        # reshape
+        grad_o = hidden_to_head_shape(grad_o, ctx.num_heads)
+        
+        # backward of second GEMM: O = A @ V
+        # d L / d V = A.T @ d L / d O
+        grad_v = a.transpose(-2, -1) @ grad_o
+        grad_a = grad_o @ v.transpose(-2, -1)
+
+        # backward of softmax
+        grad_s = softmax_backward(a, grad_a)
+
+        # backward of first GEMM: S = Q @ K.T / sqrt(d_k)
+        grad_s = grad_s / math.sqrt(ctx.head_dim)
+        # d L / d K = (d L / d S)^T @ Q
+        grad_k = grad_s.transpose(-2, -1) @ q
+        # d L / d Q = d L / d S @ K
+        grad_q = grad_s @ k
+
+        BLOCK_SIZE, num_warps = calculate_settings(ctx.head_dim // 2)
+        N_GROUPS = 128
+        grad_q = rope_backward(grad_q.transpose(1, 2), cos, sin, N_GROUPS, BLOCK_SIZE, num_warps).transpose(1, 2) # TODO: other params
+        grad_k = rope_backward(grad_k.transpose(1, 2), cos, sin, N_GROUPS, BLOCK_SIZE, num_warps).transpose(1, 2)
+
+        grad_q = head_to_hidden_shape(grad_q)
+        grad_k = head_to_hidden_shape(grad_k)
+        grad_v = head_to_hidden_shape(grad_v)
+        
+        # backward of q_proj
+        grad_w_q_lora_a, grad_w_q_lora_b, grad_x = lora_backward(w_q, w_q_quant_state, w_q_lora_a, w_q_lora_b, x_norm_1, q_lora_a, grad_q)
+
+        # backward of k_proj
+        grad_w_k_lora_a, grad_w_k_lora_b, grad_x_temp = lora_backward(w_k, w_k_quant_state, w_k_lora_a, w_k_lora_b, x_norm_1, k_lora_a, grad_k)
+        grad_x += grad_x_temp
+
+        # backward of v_proj
+        grad_w_v_lora_a, grad_w_v_lora_b, grad_x_temp = lora_backward(w_v, w_v_quant_state, w_v_lora_a, w_v_lora_b, x_norm_1, v_lora_a, grad_v)
+        grad_x += grad_x_temp
+        
+        # layernorm or rmsnorm backward
+        grad_norm_1, _ = rmsnorm_backward(
+            grad_x, x, norm_weight_1, mean_1, rstd_1, # TODO: other params
+            True, 1e-5, ctx.num_warps, ctx.block_size
+        )
+            
+        # residual connection
+        grad_input = grad_norm_1 + grad_medium
+        
+        return (
+            grad_input,
+            #############attention part#############
+            None,
+            None,
+            ####################################
+            None,
+            None,
+            ####################################
+            None,
+            None,
+            None,
+            grad_w_q_lora_a,
+            grad_w_q_lora_b,
+            ####################################
+            None,
+            None,
+            None,
+            grad_w_k_lora_a,
+            grad_w_k_lora_b,
+            ####################################
+            None,
+            None,
+            None,
+            grad_w_v_lora_a,
+            grad_w_v_lora_b,
+            ####################################
+            None,
+            None,
+            None,
+            grad_w_o_lora_a,
+            grad_w_o_lora_b,
+            ####################################
+            None,
+            None,
+            ####################################
+            None,
+            None,
+            None,
+            grad_w_gate_lora_a,
+            grad_w_gate_lora_b,
+            ####################################
+            None,
+            None,
+            None,
+            grad_w_up_lora_a,
+            grad_w_up_lora_b,
+            ####################################
+            None,
+            None,
+            None,
+            grad_w_down_lora_a,
+            grad_w_down_lora_b
+        ) + (None,) * 3
+
+
+class FusedLlamaLayer(torch.nn.Module):
+    def __init__(
+        self,
+        hidden_dim: int,
+        num_heads: int,
+    ):
+        super(FusedLlamaLayer, self).__init__()
+        self.hidden_dim = hidden_dim
+        self.num_heads = num_heads
+        self.iteration = 0
+        self.static_value = None
+        
+    def forward(
+        self,
+        input: torch.Tensor,
+        ############################################
+        norm_weight_1: torch.Tensor,
+        norm_bias_1: torch.Tensor,
+        cos: torch.Tensor,
+        sin: torch.Tensor,
+        q_proj_base: bnb.nn.modules.Linear4bit,
+        q_proj_lora_a: torch.nn.Linear,
+        q_proj_lora_b: torch.nn.Linear,
+        k_proj_base: bnb.nn.modules.Linear4bit,
+        k_proj_lora_a: torch.nn.Linear,
+        k_proj_lora_b: torch.nn.Linear,
+        v_proj_base: bnb.nn.modules.Linear4bit,
+        v_proj_lora_a: torch.nn.Linear,
+        v_proj_lora_b: torch.nn.Linear,
+        o_proj_base: bnb.nn.modules.Linear4bit,
+        o_proj_lora_a: torch.nn.Linear,
+        o_proj_lora_b: torch.nn.Linear,
+        ############################################
+        norm_weight_2: torch.Tensor,
+        norm_bias_2: torch.Tensor,
+        gate_proj_base: bnb.nn.modules.Linear4bit,
+        gate_proj_lora_a: torch.nn.Linear,
+        gate_proj_lora_b: torch.nn.Linear,
+        up_proj_base: bnb.nn.modules.Linear4bit,
+        up_proj_lora_a: torch.nn.Linear,
+        up_proj_lora_b: torch.nn.Linear,
+        down_proj_base: bnb.nn.modules.Linear4bit,
+        down_proj_lora_a: torch.nn.Linear,
+        down_proj_lora_b: torch.nn.Linear,
+        ############################################
+        attention_mask: torch.Tensor,
+        num_heads: int,
+        head_dim: int,
+    ):
+        y = FusedLlamaLayerFunc.apply(
+            input,
+            #############attention part#############
+            norm_weight_1,
+            norm_bias_1,
+            ####################################
+            cos,
+            sin,
+            ####################################
+            q_proj_base.weight,
+            q_proj_base.bias,
+            q_proj_base.weight.quant_state,
+            q_proj_lora_a.default.weight.T,
+            q_proj_lora_b.default.weight.T,
+            ####################################
+            k_proj_base.weight,
+            k_proj_base.bias,
+            k_proj_base.weight.quant_state,
+            k_proj_lora_a.default.weight.T,
+            k_proj_lora_b.default.weight.T,
+            ####################################
+            v_proj_base.weight,
+            v_proj_base.bias,
+            v_proj_base.weight.quant_state,
+            v_proj_lora_a.default.weight.T,
+            v_proj_lora_b.default.weight.T,
+            ####################################
+            o_proj_base.weight,
+            o_proj_base.bias,
+            o_proj_base.weight.quant_state,
+            o_proj_lora_a.default.weight.T,
+            o_proj_lora_b.default.weight.T,
+            #############mlp part#############
+            norm_weight_2,
+            norm_bias_2,
+            ####################################
+            gate_proj_base.weight,
+            gate_proj_base.bias,
+            gate_proj_base.weight.quant_state,
+            gate_proj_lora_a.default.weight.T,
+            gate_proj_lora_b.default.weight.T,
+            ####################################
+            up_proj_base.weight,
+            up_proj_base.bias,
+            up_proj_base.weight.quant_state,
+            up_proj_lora_a.default.weight.T,
+            up_proj_lora_b.default.weight.T,
+            ####################################
+            down_proj_base.weight,
+            down_proj_base.bias,
+            down_proj_base.weight.quant_state,
+            down_proj_lora_a.default.weight.T,
+            down_proj_lora_b.default.weight.T,
+            ####################################
+            attention_mask,
+            num_heads,
+            head_dim,
+        )
+        
+        return y
+        
