@@ -50,7 +50,7 @@ from ...utils import (
 from ...utils.import_utils import is_torch_fx_available
 from .configuration_llama import LlamaConfig
 
-from .layer2_quant_baseline import FusedLlamaLayer
+from .layer2_reorder_compress import FusedLlamaLayer
 
 if is_flash_attn_2_available():
     from flash_attn import flash_attn_func, flash_attn_varlen_func
@@ -796,7 +796,7 @@ class LlamaDecoderLayer(nn.Module):
         use_cache: Optional[bool] = False,
         **kwargs,
     ) -> Tuple[torch.FloatTensor, Optional[Tuple[torch.FloatTensor, torch.FloatTensor]]]:
-        if False:
+        if self.training:
             batch, seq_len, _ = hidden_states.shape
             hidden_states_fake = hidden_states.view(batch, self.num_attention_heads, seq_len, self.hidden_size // self.num_attention_heads)
             cos, sin = self.self_attn.rotary_emb.forward(hidden_states_fake, seq_len)
