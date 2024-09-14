@@ -42,7 +42,7 @@ from ...utils import (
 )
 from .configuration_mistral import MistralConfig
 
-from .layer import FusedMistralLayer
+from .layer_baseline import FusedMistralLayer
 
 if is_flash_attn_2_available():
     from flash_attn import flash_attn_func, flash_attn_varlen_func
