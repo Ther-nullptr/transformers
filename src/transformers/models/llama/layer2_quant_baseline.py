@@ -590,7 +590,7 @@ class FusedLlamaLayer(torch.nn.Module):
         self.iteration_threshold = 5
         self.softmax_outlier_ratio = 0.05
         self.layernorm_outlier_ratio = 0.005
-        self.q_bit = 2
+        self.q_bit = 4
         self.static_value = {
             'x': {'outlier_channel_index': None, 'scale': None},
             'x_norm_1': {'scale': None},

@@ -51,7 +51,22 @@ def lora_backward(w, w_quant_state, w_lora_a, w_lora_b, x, x_lora_a, grad_y):
     return grad_w_lora_a, grad_w_lora_b, grad_x
 
 
-class FusedLlamaLayerFunc(torch.autograd.Function):
+def repeat_kv(hidden_states: torch.Tensor, n_rep: int):
+    batch, num_key_value_heads, slen, head_dim = hidden_states.shape
+    if n_rep == 1:
+        return hidden_states
+    hidden_states = hidden_states[:, :, None, :, :].expand(batch, num_key_value_heads, n_rep, slen, head_dim)
+    return hidden_states.reshape(batch, num_key_value_heads * n_rep, slen, head_dim)
+
+
+def repeat_kv_backward(grad_output: torch.Tensor, n_rep: int):
+    batch, expand_num_key_value_heads, slen, head_dim = grad_output.shape
+    num_key_value_heads = expand_num_key_value_heads // n_rep
+    grad_output = grad_output.reshape(batch, num_key_value_heads, n_rep, slen, head_dim)
+    return grad_output.sum(dim=2)
+
+
+class FusedMistralLayerFunc(torch.autograd.Function):
     @staticmethod
     def forward(
         ctx,
@@ -110,6 +125,7 @@ class FusedLlamaLayerFunc(torch.autograd.Function):
         ###############other################
         attention_mask: torch.Tensor,
         num_heads: int,
+        num_k_heads: int, # shrinked heads
         head_dim: int,
         ###############about statistics################
         iteration: int,
@@ -168,19 +184,16 @@ class FusedLlamaLayerFunc(torch.autograd.Function):
         
         # reshape
         q = hidden_to_head_shape(q, num_heads)
-        k = hidden_to_head_shape(k, num_heads)
-        v = hidden_to_head_shape(v, num_heads)
+        k = hidden_to_head_shape(k, num_k_heads)
+        v = hidden_to_head_shape(v, num_k_heads)
         
         ctx.q_shape = q.shape
 
         q = rope_forward(q.transpose(1, 2), cos, sin).transpose(1, 2)
         k = rope_forward(k.transpose(1, 2), cos, sin).transpose(1, 2)
 
-        # q,k,v: [bsz, num_heads, q_len, head_dim]
-        # notice forward process no need to drop heads
-        bsz, num_heads, q_len, head_dim = q.shape
-
         # forward: S = Q @ K.T / sqrt(d_k)
+        k = repeat_kv(k, n_rep=num_heads // num_k_heads)
         s = q @ k.transpose(-2, -1) / math.sqrt(head_dim)
         del q, k
         
@@ -199,6 +212,7 @@ class FusedLlamaLayerFunc(torch.autograd.Function):
         )
 
         # forward: O = A @ V
+        v = repeat_kv(v, n_rep=num_heads // num_k_heads)
         o = a @ v
         del a, v
         
@@ -319,6 +333,7 @@ class FusedLlamaLayerFunc(torch.autograd.Function):
         ctx.input_layernorm_channel = x_channel_idx 
         ctx.post_layernorm_channel = x_medium_channel_idx
         ctx.num_heads = num_heads
+        ctx.num_k_heads = num_k_heads
         ctx.block_size = block_size
         ctx.num_warps = num_warps
         ctx.head_dim = head_dim
@@ -451,13 +466,15 @@ class FusedLlamaLayerFunc(torch.autograd.Function):
         a = a_o.to_dense()
         v_main = decompression_dequantization(v_main_q, v_main_scale, ctx.q_bit)
         v = v_main + v_lora_a.to(v_main.dtype) @ w_v_lora_b.to(v_main.dtype)
-        v = hidden_to_head_shape(v, ctx.num_heads)
+        v = hidden_to_head_shape(v, ctx.num_k_heads)
+        v = repeat_kv(v, n_rep=ctx.num_heads // ctx.num_k_heads)
         del a_o, v_main_q, v_main_scale, v_main
         
         # backward of second GEMM: O = A @ V
         # d L / d V = A.T @ d L / d O
         grad_v = a.transpose(-2, -1) @ grad_o
         grad_a = grad_o @ v.transpose(-2, -1)
+        grad_v = repeat_kv_backward(grad_v, n_rep=ctx.num_heads // ctx.num_k_heads)
         del grad_o, v
 
         # backward of softmax
@@ -475,13 +492,15 @@ class FusedLlamaLayerFunc(torch.autograd.Function):
         del q_main
         q = rope_forward(q.transpose(1, 2), cos, sin).transpose(1, 2)
         grad_k = grad_s.transpose(-2, -1) @ q
+        grad_k = repeat_kv_backward(grad_k, n_rep=ctx.num_heads // ctx.num_k_heads)
         
         k_main = decompression_dequantization(k_main_q, k_main_scale, ctx.q_bit)
         del k_main_q, k_main_scale
         k = k_main + k_lora_a.to(k_main.dtype) @ w_k_lora_b.to(k_main.dtype)
-        k = hidden_to_head_shape(k, ctx.num_heads)
+        k = hidden_to_head_shape(k, ctx.num_k_heads)
         del k_main
         k = rope_forward(k.transpose(1, 2), cos, sin).transpose(1, 2)
+        k = repeat_kv(k, n_rep=ctx.num_heads // ctx.num_k_heads)
         grad_q = grad_s @ k
         del grad_s, k
 
@@ -575,23 +594,25 @@ class FusedLlamaLayerFunc(torch.autograd.Function):
             None,
             grad_w_down_lora_a,
             grad_w_down_lora_b
-        ) + (None,) * 9
+        ) + (None,) * 10
 
 
-class FusedLlamaLayer(torch.nn.Module):
+class FusedMistralLayer(torch.nn.Module):
     def __init__(
         self,
         hidden_dim: int,
         num_heads: int,
+        num_k_heads: int,
     ):
-        super(FusedLlamaLayer, self).__init__()
+        super(FusedMistralLayer, self).__init__()
         self.hidden_dim = hidden_dim
         self.num_heads = num_heads
+        self.num_k_heads = num_k_heads
         self.iteration = 0
         self.iteration_threshold = 5
         self.softmax_outlier_ratio = 0.05
         self.layernorm_outlier_ratio = 0.005
-        self.q_bit = 4
+        self.q_bit = 2
         self.static_value = {
             'x': {'outlier_channel_index': None, 'scale': None},
             'x_norm_1': {'scale': None},
@@ -641,6 +662,7 @@ class FusedLlamaLayer(torch.nn.Module):
         ############################################
         attention_mask: torch.Tensor,
         num_heads: int,
+        num_k_heads: int,
         head_dim: int,
     ):
         y, x_channel_idx, x_scale, \
@@ -649,7 +671,7 @@ class FusedLlamaLayer(torch.nn.Module):
         a_threshold, o_scale, \
         x_medium_channel_idx, x_medium_scale, \
         x_norm_2_scale, \
-        gate_main_scale, up_main_scale = FusedLlamaLayerFunc.apply(
+        gate_main_scale, up_main_scale = FusedMistralLayerFunc.apply(
             input,
             #############attention part#############
             norm_weight_1,
@@ -705,6 +727,7 @@ class FusedLlamaLayer(torch.nn.Module):
             ####################################
             attention_mask,
             num_heads,
+            num_k_heads,
             head_dim,
             ####################################
             self.iteration,

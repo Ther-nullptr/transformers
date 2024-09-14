@@ -42,6 +42,8 @@ from ...utils import (
 )
 from .configuration_mistral import MistralConfig
 
+from .layer_baseline import FusedMistralLayer
+
 if is_flash_attn_2_available():
     from flash_attn import flash_attn_func, flash_attn_varlen_func
     from flash_attn.bert_padding import index_first_axis, pad_input, unpad_input  # noqa
@@ -606,6 +608,8 @@ class MistralDecoderLayer(nn.Module):
     def __init__(self, config: MistralConfig):
         super().__init__()
         self.hidden_size = config.hidden_size
+        self.num_attention_heads = config.num_attention_heads
+        self.num_key_heads = config.num_key_value_heads
         self.self_attn = (
             MistralAttention(config=config)
             if not getattr(config, "_flash_attn_2_enabled", False)
@@ -614,10 +618,64 @@ class MistralDecoderLayer(nn.Module):
         self.mlp = MistralMLP(config)
         self.input_layernorm = MistralRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.post_attention_layernorm = MistralRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.fused_mistral_layer = FusedMistralLayer(config.hidden_size, config.num_attention_heads, config.num_key_value_heads)
+    
+    def forward(        
+        self,
+        hidden_states: torch.Tensor,
+        attention_mask: Optional[torch.Tensor] = None,
+        position_ids: Optional[torch.LongTensor] = None,
+        past_key_value: Optional[Tuple[torch.Tensor]] = None,
+        output_attentions: Optional[bool] = False,
+        use_cache: Optional[bool] = False,
+        **kwargs,
+    ) -> Tuple[torch.FloatTensor, Optional[Tuple[torch.FloatTensor, torch.FloatTensor]]]:
+        if self.training:
+            batch, seq_len, _ = hidden_states.shape
+            hidden_states_fake = hidden_states.view(batch, self.num_attention_heads, seq_len, self.hidden_size // self.num_attention_heads)
+            cos, sin = self.self_attn.rotary_emb.forward(hidden_states_fake, seq_len)
+            del hidden_states_fake
+            
+            outputs = self.fused_mistral_layer.forward(
+                hidden_states,
+                self.input_layernorm.weight,
+                None,
+                cos,
+                sin,
+                self.self_attn.q_proj.base_layer,
+                self.self_attn.q_proj.lora_A,
+                self.self_attn.q_proj.lora_B,
+                self.self_attn.k_proj.base_layer,
+                self.self_attn.k_proj.lora_A,
+                self.self_attn.k_proj.lora_B,
+                self.self_attn.v_proj.base_layer,
+                self.self_attn.v_proj.lora_A,
+                self.self_attn.v_proj.lora_B,
+                self.self_attn.o_proj.base_layer,
+                self.self_attn.o_proj.lora_A,
+                self.self_attn.o_proj.lora_B,
+                self.post_attention_layernorm.weight,
+                None,
+                self.mlp.gate_proj.base_layer,
+                self.mlp.gate_proj.lora_A,
+                self.mlp.gate_proj.lora_B,
+                self.mlp.up_proj.base_layer,
+                self.mlp.up_proj.lora_A,
+                self.mlp.up_proj.lora_B,
+                self.mlp.down_proj.base_layer,
+                self.mlp.down_proj.lora_A,
+                self.mlp.down_proj.lora_B,
+                attention_mask,
+                self.num_attention_heads,
+                self.num_key_heads,
+                self.hidden_size // self.num_attention_heads,
+            )
+            return (outputs,)
         
-        self.use_full_layer = False
+        else:
+            return self.forward_old(hidden_states, attention_mask, position_ids, past_key_value, output_attentions, use_cache, **kwargs)
 
-    def forward(
+    def forward_old(
         self,
         hidden_states: torch.Tensor,
         attention_mask: Optional[torch.Tensor] = None,
@@ -929,7 +987,7 @@ class MistralModel(MistralPreTrainedModel):
 
             hidden_states = layer_outputs[0]
 
-            if use_cache:
+            if not self.training and use_cache:
                 next_decoder_cache += (layer_outputs[2 if output_attentions else 1],)
 
             if output_attentions:

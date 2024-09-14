@@ -51,6 +51,8 @@ from flash_attn.bert_padding import index_first_axis, index_put_first_axis
 import torch.nn.functional as F
 from einops import rearrange
 
+from .roberta_layer import FusedRobertaLayer
+
 logger = logging.get_logger(__name__)
 
 _CHECKPOINT_FOR_DOC = "FacebookAI/roberta-base"
@@ -418,7 +420,7 @@ ROBERTA_SELF_ATTENTION_CLASSES = {
 class RobertaAttention(nn.Module):
     def __init__(self, config, position_embedding_type=None):
         super().__init__()
-        self.self = ROBERTA_SELF_ATTENTION_CLASSES[config._attn_implementation](
+        self.self = RobertaSelfAttention(
             config, position_embedding_type=position_embedding_type
         )
         self.output = RobertaSelfOutput(config)
@@ -512,8 +514,51 @@ class RobertaLayer(nn.Module):
             self.crossattention = RobertaAttention(config, position_embedding_type="absolute")
         self.intermediate = RobertaIntermediate(config)
         self.output = RobertaOutput(config)
-
+        self.hidden_size = config.hidden_size
+        self.num_attention_heads = config.num_attention_heads
+        self.fused_roberta_layer = FusedRobertaLayer(config.hidden_size, config.num_attention_heads)
+        
     def forward(
+        self,
+        hidden_states: torch.Tensor,
+        attention_mask: Optional[torch.FloatTensor] = None,
+        head_mask: Optional[torch.FloatTensor] = None,
+        encoder_hidden_states: Optional[torch.FloatTensor] = None,
+        encoder_attention_mask: Optional[torch.FloatTensor] = None,
+        past_key_value: Optional[Tuple[Tuple[torch.FloatTensor]]] = None,
+        output_attentions: Optional[bool] = False,
+    ) -> Tuple[torch.Tensor]:
+        out = self.fused_roberta_layer.forward(
+            hidden_states,
+            self.attention.self.query.base_layer,
+            self.attention.self.query.lora_A,
+            self.attention.self.query.lora_B,
+            self.attention.self.key.base_layer,
+            self.attention.self.key.lora_A,
+            self.attention.self.key.lora_B,
+            self.attention.self.value.base_layer,
+            self.attention.self.value.lora_A,
+            self.attention.self.value.lora_B,
+            self.attention.output.dense.base_layer,
+            self.attention.output.dense.lora_A,
+            self.attention.output.dense.lora_B,
+            self.attention.output.LayerNorm.weight,
+            self.attention.output.LayerNorm.bias,
+            self.intermediate.dense.base_layer,
+            self.intermediate.dense.lora_A,
+            self.intermediate.dense.lora_B,
+            self.output.dense.base_layer,
+            self.output.dense.lora_A,
+            self.output.dense.lora_B,
+            self.output.LayerNorm.weight,
+            self.output.LayerNorm.bias,
+            attention_mask,
+            self.num_attention_heads,
+            self.hidden_size // self.num_attention_heads,
+        )
+        return (out,)
+
+    def forward_old(
         self,
         hidden_states: torch.Tensor,
         attention_mask: Optional[torch.FloatTensor] = None,
@@ -1553,7 +1598,7 @@ class RobertaClassificationHead(nn.Module):
     def forward(self, features, **kwargs):
         x = features[:, 0, :]  # take <s> token (equiv. to [CLS])
         x = self.dropout(x)
-        x = self.class_intermediate(x)
+        x = self.class_intermediate(x.to(torch.float32))
         x = torch.tanh(x)
         x = self.dropout(x)
         x = self.out_proj(x)
