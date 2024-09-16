@@ -50,7 +50,7 @@ from ...utils import (
 from ...utils.import_utils import is_torch_fx_available
 from .configuration_llama import LlamaConfig
 
-from .layer2_quant_all_content import FusedLlamaLayer
+from .layer2_select_quant import FusedLlamaLayer
 
 if is_flash_attn_2_available():
     from flash_attn import flash_attn_func, flash_attn_varlen_func
