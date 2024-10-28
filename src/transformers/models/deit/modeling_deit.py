@@ -43,6 +43,7 @@ from ...utils import (
     replace_return_docstrings,
 )
 from .configuration_deit import DeiTConfig
+from .deit_reorder import FusedViTLayer as FusedDeiTLayer
 
 
 logger = logging.get_logger(__name__)
@@ -295,8 +296,51 @@ class DeiTLayer(nn.Module):
         self.output = DeiTOutput(config)
         self.layernorm_before = nn.LayerNorm(config.hidden_size, eps=config.layer_norm_eps)
         self.layernorm_after = nn.LayerNorm(config.hidden_size, eps=config.layer_norm_eps)
-
+        self.fused_deit_layer = FusedDeiTLayer(config.hidden_size, config.num_attention_heads)
+        
+        self.hidden_size = config.hidden_size
+        self.num_attention_heads = config.num_attention_heads
+        
     def forward(
+        self,
+        hidden_states: torch.Tensor,
+        head_mask: Optional[torch.Tensor] = None,
+        output_attentions: bool = False,
+    ) -> Union[Tuple[torch.Tensor, torch.Tensor], Tuple[torch.Tensor]]:
+        # if self.training:
+        outputs = self.fused_deit_layer.forward(
+            hidden_states,
+            self.attention.attention.query.base_layer,
+            self.attention.attention.query.lora_A,
+            self.attention.attention.query.lora_B,
+            self.attention.attention.key.base_layer,
+            self.attention.attention.key.lora_A,
+            self.attention.attention.key.lora_B,
+            self.attention.attention.value.base_layer,
+            self.attention.attention.value.lora_A,
+            self.attention.attention.value.lora_B,
+            self.attention.output.dense.base_layer,
+            self.attention.output.dense.lora_A,
+            self.attention.output.dense.lora_B,
+            self.layernorm_before.weight,
+            self.layernorm_before.bias,
+            self.intermediate.dense.base_layer,
+            self.intermediate.dense.lora_A,
+            self.intermediate.dense.lora_B,
+            self.output.dense.base_layer,
+            self.output.dense.lora_A,
+            self.output.dense.lora_B,
+            self.layernorm_after.weight,
+            self.layernorm_after.bias,
+            None,
+            self.num_attention_heads,
+            self.hidden_size // self.num_attention_heads,
+        )
+        # else:
+        #     outputs = self.forward_old(hidden_states, head_mask, output_attentions)
+        return (outputs,)
+
+    def forward_old(
         self,
         hidden_states: torch.Tensor,
         head_mask: Optional[torch.Tensor] = None,

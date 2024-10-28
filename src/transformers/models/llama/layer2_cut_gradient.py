@@ -18,7 +18,7 @@ def hidden_to_head_shape(x: torch.Tensor, num_heads: int):
 
 
 def head_to_hidden_shape(x: torch.Tensor):
-    bsz, num_heads, seq_len, head_dim = x.shape
+    bsz, _, seq_len, _ = x.shape
     return x.transpose(1, 2).reshape(bsz, seq_len, -1)
 
 
@@ -42,7 +42,11 @@ def lora_backward(w, w_quant_state, w_lora_a, w_lora_b, x, x_lora_a, grad_y):
     return grad_w_lora_a, grad_w_lora_b, grad_x
 
 
-def repeat_kv(hidden_states: torch.Tensor, n_rep: int):
+def repeat_kv(hidden_states: torch.Tensor, n_rep: int) -> torch.Tensor:
+    """
+    This is the equivalent of torch.repeat_interleave(x, dim=1, repeats=n_rep). The hidden states go from (batch,
+    num_key_value_heads, seqlen, head_dim) to (batch, num_attention_heads, seqlen, head_dim)
+    """
     batch, num_key_value_heads, slen, head_dim = hidden_states.shape
     if n_rep == 1:
         return hidden_states
@@ -50,11 +54,14 @@ def repeat_kv(hidden_states: torch.Tensor, n_rep: int):
     return hidden_states.reshape(batch, num_key_value_heads * n_rep, slen, head_dim)
 
 
-def repeat_kv_backward(grad_output: torch.Tensor, n_rep: int):
-    batch, expand_num_key_value_heads, slen, head_dim = grad_output.shape
-    num_key_value_heads = expand_num_key_value_heads // n_rep
-    grad_output = grad_output.reshape(batch, num_key_value_heads, n_rep, slen, head_dim)
-    return grad_output.sum(dim=2)
+def print_gradient_info(grad, name):
+    grad_norm = torch.norm(grad[0], dim=-1).sort()
+    print(f"{name} grad norm min: ", grad_norm.indices[:60])
+    print(f"{name} grad norm max: ", grad_norm.indices[-60:])
+    # print(f"{name} grad norm max:", grad_norm.indices[-20:])
+    print(f"{name} grad norm max/min: ", grad_norm.values[-60:] / grad_norm.values[:60])
+    print(f"{name} grad norm mean: ", grad_norm.values.mean())
+    print(f"{name} grad norm median: ", grad_norm.values.median())
 
 
 class FusedLlamaLayerFunc(torch.autograd.Function):
@@ -120,19 +127,16 @@ class FusedLlamaLayerFunc(torch.autograd.Function):
     ):
         # layernorm or rmsnorm
         x_norm_1, mean_1, rstd_1, _, _ = rmsnorm_forward(x, norm_weight_1, eps = 1e-5)
-        
-        #* compress the (copy of) x
-        x_copy = x.clone()
 
         # compute q,k,v
         # forward process: q_proj
-        q, q_main, q_lora_a = lora_forward(w_q, w_q_quant_state, w_q_lora_a, w_q_lora_b, b_q, x_norm_1)
+        q, _, q_lora_a = lora_forward(w_q, w_q_quant_state, w_q_lora_a, w_q_lora_b, b_q, x_norm_1)
 
         # forward process: k_proj
-        k, k_main, k_lora_a = lora_forward(w_k, w_k_quant_state, w_k_lora_a, w_k_lora_b, b_k, x_norm_1)
+        k, _, k_lora_a = lora_forward(w_k, w_k_quant_state, w_k_lora_a, w_k_lora_b, b_k, x_norm_1)
 
         # forward process: v_proj
-        v, v_main, v_lora_a = lora_forward(w_v, w_v_quant_state, w_v_lora_a, w_v_lora_b, b_v, x_norm_1)
+        v, _, v_lora_a = lora_forward(w_v, w_v_quant_state, w_v_lora_a, w_v_lora_b, b_v, x_norm_1)
         
         # reshape
         q = hidden_to_head_shape(q, num_heads)
@@ -162,7 +166,7 @@ class FusedLlamaLayerFunc(torch.autograd.Function):
         o = head_to_hidden_shape(o)
 
         # forward process: o_proj
-        o_final, o_final_main, o_final_lora_a = lora_forward(w_o, w_o_quant_state, w_o_lora_a, w_o_lora_b, b_o, o)
+        o_final, _, o_final_lora_a = lora_forward(w_o, w_o_quant_state, w_o_lora_a, w_o_lora_b, b_o, o)
         
         # residual connection
         x_medium = x + o_final
@@ -170,14 +174,11 @@ class FusedLlamaLayerFunc(torch.autograd.Function):
         # layernorm or rmsnorm
         x_norm_2, mean_2, rstd_2, block_size, num_warps = rmsnorm_forward(x_medium, norm_weight_2, eps = 1e-5)
         
-        #* compress the (copy of) x_medium
-        x_medium_copy = x_medium.clone()
-        
         # forward process: gate_proj
-        gate, gate_main, gate_lora_a = lora_forward(w_gate, w_gate_quant_state, w_gate_lora_a, w_gate_lora_b, b_gate, x_norm_2)
+        gate, _, gate_lora_a = lora_forward(w_gate, w_gate_quant_state, w_gate_lora_a, w_gate_lora_b, b_gate, x_norm_2)
         
         # forward process: up_proj
-        up, up_main, up_lora_a = lora_forward(w_up, w_up_quant_state, w_up_lora_a, w_up_lora_b, b_up, x_norm_2)
+        up, _, up_lora_a = lora_forward(w_up, w_up_quant_state, w_up_lora_a, w_up_lora_b, b_up, x_norm_2)
         
         # apply activation function (for gate)
         fn = torch.nn.functional.silu(gate)
@@ -186,7 +187,7 @@ class FusedLlamaLayerFunc(torch.autograd.Function):
         hadamard = up * fn
             
         # forward process: down_proj
-        down, down_main, down_lora_a = lora_forward(w_down, w_down_quant_state, w_down_lora_a, w_down_lora_b, b_down, hadamard)
+        down, _, down_lora_a = lora_forward(w_down, w_down_quant_state, w_down_lora_a, w_down_lora_b, b_down, hadamard)
         
         # residual connection
         x_out = x_medium + down
@@ -359,6 +360,12 @@ class FusedLlamaLayerFunc(torch.autograd.Function):
             w_down_lora_a,
             w_down_lora_b,
         ) = ctx.saved_tensors
+        #* print(grad_output.shape)
+        
+        print('---------------------------------------------')
+        
+        # print the norm of grad_down(per token & per channel)
+        #* print_gradient_info(grad_output, "grad_output")
         
         # down proj part
         grad_w_down_lora_a, grad_w_down_lora_b, grad_down = lora_backward(w_down, w_down_quant_state, w_down_lora_a, w_down_lora_b, hadamard, down_lora_a, grad_output)
@@ -370,12 +377,18 @@ class FusedLlamaLayerFunc(torch.autograd.Function):
         # TODO: activation backward
         grad_fn = silu_backward(gate, grad_hadamard_1)
         
+        #* print_gradient_info(grad_fn, "grad_fn")
+        
         # gate proj part
         grad_w_gate_lora_a, grad_w_gate_lora_b, grad_gate = lora_backward(w_gate, w_gate_quant_state, w_gate_lora_a, w_gate_lora_b, x_norm_2, gate_lora_a, grad_fn)
         
         # up proj part
+        #* print_gradient_info(grad_hadamard_2, "grad_hadamard_2")
+        
         grad_w_up_lora_a, grad_w_up_lora_b, grad_up = lora_backward(w_up, w_up_quant_state, w_up_lora_a, w_up_lora_b, x_norm_2, up_lora_a, grad_hadamard_2)
         grad_gate_up = grad_up + grad_gate
+        
+        #* print_gradient_info(grad_gate_up, "grad_gate_up")
         
         # layernorm & rmsnorm backward
         grad_norm_2, _ = rmsnorm_backward(
@@ -384,10 +397,17 @@ class FusedLlamaLayerFunc(torch.autograd.Function):
         )
         
         # residual connection
+        # print the norm of grad_down(per token & per channel)
+        #* print_gradient_info(grad_norm_2, "grad_norm_2")
+        
         grad_medium = grad_norm_2 + grad_output
+        
+        #* print_gradient_info(grad_medium, "grad_medium")
         
         # o part
         grad_w_o_lora_a, grad_w_o_lora_b, grad_o = lora_backward(w_o, w_o_quant_state, w_o_lora_a, w_o_lora_b, o, o_final_lora_a, grad_medium)
+        
+        #* print_gradient_info(grad_o, "grad_o")
         
         # reshape
         grad_o = hidden_to_head_shape(grad_o, ctx.num_heads)
@@ -399,6 +419,7 @@ class FusedLlamaLayerFunc(torch.autograd.Function):
 
         # backward of softmax
         grad_s = softmax_backward(a, grad_a)
+        # print_gradient_info(grad_s, "grad_s")
 
         # backward of first GEMM: S = Q @ K.T / sqrt(d_k)
         grad_s = grad_s / math.sqrt(ctx.head_dim)
@@ -416,22 +437,29 @@ class FusedLlamaLayerFunc(torch.autograd.Function):
         grad_k = head_to_hidden_shape(grad_k)
         grad_v = head_to_hidden_shape(grad_v)
         
+        grad_x = None
+        
         # backward of q_proj
-        grad_w_q_lora_a, grad_w_q_lora_b, grad_x = lora_backward(w_q, w_q_quant_state, w_q_lora_a, w_q_lora_b, x_norm_1, q_lora_a, grad_q)
-
+        grad_w_q_lora_a, grad_w_q_lora_b, grad_x_q = lora_backward(w_q, w_q_quant_state, w_q_lora_a, w_q_lora_b, x_norm_1, q_lora_a, grad_q)
+        grad_x = grad_x_q
+        
         # backward of k_proj
-        grad_w_k_lora_a, grad_w_k_lora_b, grad_x_temp = lora_backward(w_k, w_k_quant_state, w_k_lora_a, w_k_lora_b, x_norm_1, k_lora_a, grad_k)
-        grad_x += grad_x_temp
+        grad_w_k_lora_a, grad_w_k_lora_b, grad_x_k = lora_backward(w_k, w_k_quant_state, w_k_lora_a, w_k_lora_b, x_norm_1, k_lora_a, grad_k)
+        grad_x += grad_x_k
 
         # backward of v_proj
-        grad_w_v_lora_a, grad_w_v_lora_b, grad_x_temp = lora_backward(w_v, w_v_quant_state, w_v_lora_a, w_v_lora_b, x_norm_1, v_lora_a, grad_v)
-        grad_x += grad_x_temp
+        grad_w_v_lora_a, grad_w_v_lora_b, grad_x_v = lora_backward(w_v, w_v_quant_state, w_v_lora_a, w_v_lora_b, x_norm_1, v_lora_a, grad_v)
+        grad_x += grad_x_v
+        
+        #* print_gradient_info(grad_x, "grad_x")
         
         # layernorm or rmsnorm backward
         grad_norm_1, _ = rmsnorm_backward(
             grad_x, x, norm_weight_1, mean_1, rstd_1, # TODO: other params
             True, 1e-5, ctx.num_warps, ctx.block_size
         )
+        
+        #* print_gradient_info(grad_norm_1, "grad_norm_1")
             
         # residual connection
         grad_input = grad_norm_1 + grad_medium
@@ -540,7 +568,7 @@ class FusedLlamaLayer(torch.nn.Module):
         attention_mask: torch.Tensor,
         num_heads: int,
         head_dim: int,
-        lora_alpha: float
+        lora_alpha: int
     ):
         y = FusedLlamaLayerFunc.apply(
             input,

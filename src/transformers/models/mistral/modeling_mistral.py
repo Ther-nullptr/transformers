@@ -42,7 +42,7 @@ from ...utils import (
 )
 from .configuration_mistral import MistralConfig
 
-from .layer_quant_baseline import FusedMistralLayer
+from .layer_lora_fa import FusedMistralLayer
 
 if is_flash_attn_2_available():
     from flash_attn import flash_attn_func, flash_attn_varlen_func
@@ -669,6 +669,7 @@ class MistralDecoderLayer(nn.Module):
                 self.num_attention_heads,
                 self.num_key_heads,
                 self.hidden_size // self.num_attention_heads,
+                self.self_attn.q_proj.scaling['default']
             )
             return (outputs,)
         

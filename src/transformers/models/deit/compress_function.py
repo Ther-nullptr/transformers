@@ -33,45 +33,6 @@ def get_statistics_softmax(x: torch.Tensor, outlier_ratio: float):
 
 
 @torch.no_grad
-def compress_unstructed_pruning(x: torch.Tensor, outlier: float):
-    mask = (x.abs() > outlier)
-    x_outlier = x * mask
-    x_outlier_sparse = x_outlier.to_sparse()
-    return x_outlier_sparse
-
-
-@torch.no_grad
-def decompress_unstructed_pruning(x_sparse: torch.Tensor):
-    return x_sparse.to_dense()
-
-
-@torch.no_grad
-def get_statistics_outlier(x: torch.Tensor, outlier_ratio: float):
-    outlier = torch.kthvalue(x.float().abs().flatten(), int(x.numel() * (1 - outlier_ratio))).values
-    return outlier
-
-
-@torch.no_grad
-def compress_structed_pruning(x: torch.Tensor, channel_idx: torch.Tensor):
-    x_outlier = x[:, :, channel_idx]
-    return x_outlier, channel_idx
-
-
-@torch.no_grad
-def decompress_structed_pruning(x_outlier: torch.Tensor, channel_idx: torch.Tensor, x_shape: torch.Tensor):
-    x = torch.zeros(x_shape, device=x_outlier.device, dtype=x_outlier.dtype)
-    x[:, :, channel_idx] = x_outlier
-    return x
-
-
-@torch.no_grad
-def get_statistics_structed_pruning(x: torch.Tensor, outlier_ratio: float):
-    channel_norm = x.abs().norm(dim=-2)
-    outlier_channel_index = torch.topk(channel_norm, int(x.shape[-1] * outlier_ratio), largest=True).indices
-    return outlier_channel_index
-
-
-@torch.no_grad
 def pad_cut_L(src_L, tgt_L_len):
     seq_len_1, r = src_L.shape
     seq_len_2 = tgt_L_len
@@ -290,77 +251,14 @@ def outlier_subtraction_fuse_compression_quantization(x, s, channel, quantize_bi
     # decide dtype
     x, s = x.to(dtype), s.to(dtype)
     B, M, N = x.shape
-
-    # 1D launch kernel where each block gets its own program.
-    grid = lambda META: (
-        triton.cdiv(M, META['BLOCK_SIZE_M']) * triton.cdiv(N, META['BLOCK_SIZE_N']), B
-    )
-    elem_per_position = 8 // quantize_bit
-    x_temp = torch.empty((B, M, N), device=x.device, dtype=torch.bfloat16)
-    q = torch.empty((B, M, N // elem_per_position), device=x.device, dtype=torch.uint8)
     
     # remove outlier channels
     x_outlier = x[:, :, channel]
     x[:, :, channel] = 0
     
-    # quantize the rest part
-    compression_quantization_kernel[grid](
-        x, q, x_temp, s,
-        B, M, N,
-        x.stride(0), x.stride(1), x.stride(2),
-        q.stride(0), q.stride(1), q.stride(2),
-        s.stride(0), s.stride(1),
-        quantize_bit, elem_per_position
-    )
-
-    del x_temp, x
-    return x_outlier, q
-
-
-@torch.no_grad
-def outlier_addition_fuse_decompression_dequantization(q, s, x_outlier, channel, quantize_bit=8, is_head=False, num_heads=1, dtype=torch.bfloat16):
-    B, M, _ = q.shape
-    N = s.shape[-1]
-
-    # dtype
-    s = s.to(dtype)
-
-    # 1D launch kernel where each block gets its own program.
-    elem_per_position = 8 // quantize_bit
-    grid = lambda META: (
-        triton.cdiv(M, META['BLOCK_SIZE_M']) * triton.cdiv(N, META['BLOCK_SIZE_N']), B
-    )
-    x = torch.empty((B, M, N), device=q.device, dtype=torch.bfloat16)
-    x_temp = torch.empty((B, M, N), device=q.device, dtype=torch.uint8)
-
-    decompression_dequantization_kernel[grid](
-        x, x_temp, q, s,
-        B, M, N,
-        x.stride(0), x.stride(1), x.stride(2),
-        x_temp.stride(0), x_temp.stride(1), x_temp.stride(2),
-        q.stride(0), q.stride(1), q.stride(2),
-        s.stride(0), s.stride(1),
-        quantize_bit, elem_per_position,
-    )
-    del x_temp
-    
-    x[:, :, channel] = x_outlier
-    
-    if is_head:
-        x = hidden_to_head_shape(x, num_heads=num_heads)
-    
-    return x
-
-
-@torch.no_grad
-def compression_quantization(x, s, quantize_bit=8, dtype=torch.bfloat16):
-    # Change shape if need
-    is_head = len(x.shape) == 4
-    if is_head:
-        x = head_to_hidden_shape(x)
-
-    # decide dtype
-    x, s = x.to(dtype), s.to(dtype)
+    # select the valid part
+    x_rest = x[:, 192:, :].contiguous() # the shape is illegal, so just try divide it, then merge it...
+    x = x[:, :192, :].contiguous()
     B, M, N = x.shape
 
     # 1D launch kernel where each block gets its own program.
@@ -381,12 +279,12 @@ def compression_quantization(x, s, quantize_bit=8, dtype=torch.bfloat16):
         quantize_bit, elem_per_position
     )
 
-    del x
-    return q
+    del x_temp, x
+    return x_outlier, q, x_rest
 
 
 @torch.no_grad
-def decompression_dequantization(q, s, quantize_bit=8, is_head=False, num_heads=1, dtype=torch.bfloat16):
+def outlier_addition_fuse_decompression_dequantization(q, x_rest, s, x_outlier, channel, quantize_bit=8, is_head=False, num_heads=1, dtype=torch.bfloat16):
     B, M, _ = q.shape
     N = s.shape[-1]
 
@@ -412,6 +310,86 @@ def decompression_dequantization(q, s, quantize_bit=8, is_head=False, num_heads=
     )
     del x_temp
     
+    # merge x and x_rest
+    x = torch.cat([x, x_rest], dim=1)
+    
+    x[:, :, channel] = x_outlier
+    
+    if is_head:
+        x = hidden_to_head_shape(x, num_heads=num_heads)
+    
+    return x
+
+
+@torch.no_grad
+def compression_quantization(x, s, quantize_bit=8, dtype=torch.bfloat16):
+    # Change shape if need
+    is_head = len(x.shape) == 4
+    if is_head:
+        x = head_to_hidden_shape(x)
+
+    # decide dtype
+    x, s = x.to(dtype), s.to(dtype)
+    B, M, N = x.shape
+    
+    # select the valid part
+    x_rest = x[:, 192:, :].contiguous() # the shape is illegal, so just try divide it, then merge it...
+    x = x[:, :192, :].contiguous()
+    
+    B, M, N = x.shape
+    
+    # 1D launch kernel where each block gets its own program.
+    grid = lambda META: (
+        triton.cdiv(M, META['BLOCK_SIZE_M']) * triton.cdiv(N, META['BLOCK_SIZE_N']), B
+    )
+    elem_per_position = 8 // quantize_bit
+    x_temp = torch.empty((B, M, N), device=x.device, dtype=torch.bfloat16)
+    q = torch.empty((B, M, N // elem_per_position), device=x.device, dtype=torch.uint8)
+    
+    # quantize the rest part
+    compression_quantization_kernel[grid](
+        x, q, x_temp, s,
+        B, M, N,
+        x.stride(0), x.stride(1), x.stride(2),
+        q.stride(0), q.stride(1), q.stride(2),
+        s.stride(0), s.stride(1),
+        quantize_bit, elem_per_position
+    )
+
+    del x
+    return q, x_rest
+
+
+@torch.no_grad
+def decompression_dequantization(q, x_rest, s, quantize_bit=8, is_head=False, num_heads=1, dtype=torch.bfloat16):
+    B, M, _ = q.shape
+    N = s.shape[-1]
+
+    # dtype
+    s = s.to(dtype)
+
+    # 1D launch kernel where each block gets its own program.
+    elem_per_position = 8 // quantize_bit
+    grid = lambda META: (
+        triton.cdiv(M, META['BLOCK_SIZE_M']) * triton.cdiv(N, META['BLOCK_SIZE_N']), B
+    )
+    x = torch.empty((B, M, N), device=q.device, dtype=torch.bfloat16)
+    x_temp = torch.empty((B, M, N), device=q.device, dtype=torch.uint8)
+
+    decompression_dequantization_kernel[grid](
+        x, x_temp, q, s,
+        B, M, N,
+        x.stride(0), x.stride(1), x.stride(2),
+        x_temp.stride(0), x_temp.stride(1), x_temp.stride(2),
+        q.stride(0), q.stride(1), q.stride(2),
+        s.stride(0), s.stride(1),
+        quantize_bit, elem_per_position,
+    )
+    del x_temp
+    
+    # merge x and x_rest
+    x = torch.cat([x, x_rest], dim=1)
+    
     if is_head:
         x = hidden_to_head_shape(x, num_heads=num_heads)
     
@@ -423,8 +401,8 @@ def compress_pack_channel_base(x, o_ratio, q_bit, q_method, it_num, it_num_thd, 
         o_channel_idx, scale = get_statistics_channel_base(x, o_ratio, q_bit, q_method)
     else:
         o_channel_idx, scale = static_value['outlier_channel_index'], static_value['scale']
-    o, q = outlier_subtraction_fuse_compression_quantization(x, scale, o_channel_idx, q_bit)
-    return o, q, o_channel_idx, scale
+    o, q, x_rest = outlier_subtraction_fuse_compression_quantization(x, scale, o_channel_idx, q_bit)
+    return o, q, x_rest, o_channel_idx, scale
 
 
 def compress_pack_rank_base(x, rank, q_bit, q_method, it_num, it_num_thd, static_value):
@@ -450,26 +428,8 @@ def compress_pack_quant_base(x, q_bit, q_method, it_num, it_num_thd, static_valu
         scale = get_statistics_only_quant(x, q_bit, q_method)
     else:
         scale = static_value['scale']
-    q = compression_quantization(x, scale, q_bit)
-    return q, scale
-
-
-def compress_pack_unstructed_pruning_base(x, o_ratio, it_num, it_num_thd, static_value):
-    if it_num < it_num_thd:
-        outlier = get_statistics_outlier(x, o_ratio) # a funny reuse
-    else:
-        outlier = static_value['outlier']
-    x_outlier = compress_unstructed_pruning(x, outlier)
-    return x_outlier, outlier
-
-
-def compress_pack_structed_pruning_base(x, channel_ratio, it_num, it_num_thd, static_value):
-    if it_num < it_num_thd:
-        channel_idx = get_statistics_structed_pruning(x, channel_ratio)
-    else:
-        channel_idx = static_value['outlier_channel_index']
-    x_outlier, channel_idx = compress_structed_pruning(x, channel_idx)
-    return x_outlier, channel_idx
+    q, x_rest = compression_quantization(x, scale, q_bit)
+    return q, x_rest, scale
 
 
 def compute_overhead(overhead_ratio, x, q_bit):

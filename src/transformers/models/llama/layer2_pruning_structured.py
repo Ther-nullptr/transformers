@@ -11,11 +11,9 @@ from .rope_kernels import calculate_settings, rope_forward, rope_backward
 from .silu_kernels import silu_backward
 
 from .compress_function import (
-    compress_pack_channel_base,
-    compress_pack_quant_base,
     compress_pack_softmax_base,
-    outlier_addition_fuse_decompression_dequantization,
-    decompression_dequantization,
+    compress_pack_structed_pruning_base,
+    decompress_structed_pruning,
     update_dict,
 )
 
@@ -117,17 +115,15 @@ class FusedLlamaLayerFunc(torch.autograd.Function):
         iteration_threshold: int,
         static_value: dict,
         softmax_outlier_ratio: float,
-        layernorm_outlier_ratio: float,
-        q_bit: int,
+        outlier_ratio: float,
     ):
         # layernorm or rmsnorm
         x_norm_1, mean_1, rstd_1, _, _ = rmsnorm_forward(x, norm_weight_1, eps = 1e-5)
         
         #* compress the (copy of) x
         x_copy = x.clone()
-        x_o, x_q, x_channel_idx, x_scale = compress_pack_channel_base(
-            x=x_copy, o_ratio=layernorm_outlier_ratio, q_bit=q_bit,
-            q_method='per-channel', it_num=iteration,
+        x_o, x_threshold = compress_pack_structed_pruning_base(
+            x=x_copy, channel_ratio=outlier_ratio, it_num=iteration,
             it_num_thd=iteration_threshold, static_value=static_value['x']
         )
 
@@ -142,9 +138,8 @@ class FusedLlamaLayerFunc(torch.autograd.Function):
         v, _, v_lora_a = lora_forward(w_v, w_v_quant_state, w_v_lora_a, w_v_lora_b, b_v, x_norm_1, lora_scale)
         
         #* compress x_norm_1
-        x_norm_1_q, x_norm_1_scale = compress_pack_quant_base(
-            x=x_norm_1, q_bit=q_bit,
-            q_method='per-channel', it_num=iteration,
+        x_norm_1_o, x_norm_1_threshold = compress_pack_structed_pruning_base(
+            x=x_norm_1, channel_ratio=outlier_ratio, it_num=iteration,
             it_num_thd=iteration_threshold, static_value=static_value['x_norm_1']
         )
         del x_norm_1
@@ -163,14 +158,14 @@ class FusedLlamaLayerFunc(torch.autograd.Function):
         s = q @ k.transpose(-2, -1) / math.sqrt(head_dim)
         
         #* compress q, k
-        q_q, q_scale = compress_pack_quant_base(
-            x=q, q_bit=q_bit,
-            q_method='per-channel', it_num=iteration,
+        q = head_to_hidden_shape(q)
+        q_o, q_threshold = compress_pack_structed_pruning_base(
+            x=q, channel_ratio=outlier_ratio, it_num=iteration,
             it_num_thd=iteration_threshold, static_value=static_value['q']
         )
-        k_q, k_scale = compress_pack_quant_base(
-            x=k, q_bit=q_bit,
-            q_method='per-channel', it_num=iteration,
+        k = head_to_hidden_shape(k)
+        k_o, k_threshold = compress_pack_structed_pruning_base(
+            x=k, channel_ratio=outlier_ratio, it_num=iteration,
             it_num_thd=iteration_threshold, static_value=static_value['k']
         )
         del q, k
@@ -194,9 +189,9 @@ class FusedLlamaLayerFunc(torch.autograd.Function):
         del a
         
         #* compress v
-        v_q, v_scale = compress_pack_quant_base(
-            x=v, q_bit=q_bit,
-            q_method='per-channel', it_num=iteration,
+        v = head_to_hidden_shape(v)
+        v_o, v_threshold = compress_pack_structed_pruning_base(
+            x=v, channel_ratio=outlier_ratio, it_num=iteration,
             it_num_thd=iteration_threshold, static_value=static_value['v']
         )
         del v
@@ -208,9 +203,8 @@ class FusedLlamaLayerFunc(torch.autograd.Function):
         o_final, _, o_final_lora_a = lora_forward(w_o, w_o_quant_state, w_o_lora_a, w_o_lora_b, b_o, o, lora_scale)
         
         #* compress o
-        o_q, o_scale = compress_pack_quant_base(
-            x=o, q_bit=q_bit,
-            q_method='per-channel', it_num=iteration,
+        o_o, o_threshold = compress_pack_structed_pruning_base(
+            x=o, channel_ratio=outlier_ratio, it_num=iteration,
             it_num_thd=iteration_threshold, static_value=static_value['o']
         )
         del o
@@ -224,9 +218,8 @@ class FusedLlamaLayerFunc(torch.autograd.Function):
         
         #* compress the (copy of) x_medium
         x_medium_copy = x_medium.clone()
-        x_medium_o, x_medium_q, x_medium_channel_idx, x_medium_scale = compress_pack_channel_base(
-            x=x_medium_copy, o_ratio=layernorm_outlier_ratio, q_bit=q_bit,
-            q_method='per-channel', it_num=iteration,
+        x_medium_o, x_medium_threshold = compress_pack_structed_pruning_base(
+            x=x_medium_copy, channel_ratio=outlier_ratio, it_num=iteration,
             it_num_thd=iteration_threshold, static_value=static_value['x_medium']
         )
         
@@ -237,9 +230,8 @@ class FusedLlamaLayerFunc(torch.autograd.Function):
         up, _, up_lora_a = lora_forward(w_up, w_up_quant_state, w_up_lora_a, w_up_lora_b, b_up, x_norm_2, lora_scale)
 
         #* compress the x_norm_2
-        x_norm_2_q, x_norm_2_scale = compress_pack_quant_base(
-            x=x_norm_2, q_bit=q_bit,
-            q_method='per-channel', it_num=iteration,
+        x_norm_2_o, x_norm_2_threshold = compress_pack_structed_pruning_base(
+            x=x_norm_2, channel_ratio=outlier_ratio, it_num=iteration,
             it_num_thd=iteration_threshold, static_value=static_value['x_norm_2']
         )
         del x_norm_2
@@ -248,26 +240,24 @@ class FusedLlamaLayerFunc(torch.autograd.Function):
         fn = torch.nn.functional.silu(gate)
         
         #* compress the gate
-        gate_q, gate_scale = compress_pack_quant_base(
-            x=gate, q_bit=q_bit,
-            q_method='per-channel', it_num=iteration,
+        gate_o, gate_threshold = compress_pack_structed_pruning_base(
+            x=gate, channel_ratio=outlier_ratio, it_num=iteration,
             it_num_thd=iteration_threshold, static_value=static_value['gate']
         )
+        ctx.shape_2 = gate.shape
         del gate
             
         # hadamard
         hadamard = up * fn
         
         #* compress the up / fn
-        up_q, up_scale = compress_pack_quant_base(
-            x=up, q_bit=q_bit,
-            q_method='per-channel', it_num=iteration,
+        up_o, up_threshold = compress_pack_structed_pruning_base(
+            x=up, channel_ratio=outlier_ratio, it_num=iteration,
             it_num_thd=iteration_threshold, static_value=static_value['up']
         )
         del up
-        fn_q, fn_scale = compress_pack_quant_base(
-            x=fn, q_bit=q_bit,
-            q_method='per-channel', it_num=iteration,
+        fn_o, fn_threshold = compress_pack_structed_pruning_base(
+            x=fn, channel_ratio=outlier_ratio, it_num=iteration,
             it_num_thd=iteration_threshold, static_value=static_value['fn']
         )
         del fn
@@ -276,9 +266,8 @@ class FusedLlamaLayerFunc(torch.autograd.Function):
         down, _, down_lora_a = lora_forward(w_down, w_down_quant_state, w_down_lora_a, w_down_lora_b, b_down, hadamard, lora_scale)
         
         #* compress the hadamard
-        hadamard_q, hadamard_scale = compress_pack_quant_base(
-            x=hadamard, q_bit=q_bit,
-            q_method='per-channel', it_num=iteration,
+        hadamard_o, hadamard_threshold = compress_pack_structed_pruning_base(
+            x=hadamard, channel_ratio=outlier_ratio, it_num=iteration,
             it_num_thd=iteration_threshold, static_value=static_value['hadamard']
         )
         del hadamard
@@ -289,25 +278,25 @@ class FusedLlamaLayerFunc(torch.autograd.Function):
         
         ctx.save_for_backward(
             ### buffered activation (attention) ###
-            x_o, x_q, x_scale, # x
+            x_o, x_threshold, # x
             mean_1, rstd_1, # buffer for rmsnorm
-            x_norm_1_q, x_norm_1_scale, # x_norm_1
+            x_norm_1_o, x_norm_1_threshold, # x_norm_1
             cos, sin, # buffer for rope
-            q_q, q_scale, # q
-            k_q, k_scale, # k
-            v_q, v_scale, # v
+            q_o, q_threshold, # q
+            k_o, k_threshold, # k
+            v_o, v_threshold, # v
             a_o, a_threshold, # a
-            o_q, o_scale, # o
+            o_o, o_threshold, # o
             q_lora_a, k_lora_a, v_lora_a, # buffer for lora (qkv)
             o_final_lora_a, # buffer for lora (o)
             ### buffered activation (mlp) ###
             mean_2, rstd_2, # buffer for rmsnorm
-            x_medium_o, x_medium_q, x_medium_scale, # x_medium
-            x_norm_2_q, x_norm_2_scale, # x_norm_2
-            gate_q, gate_scale, # gate
-            up_q, up_scale, # up
-            fn_q, fn_scale, # fn
-            hadamard_q, hadamard_scale, # hadamard
+            x_medium_o, x_medium_threshold, # x_medium
+            x_norm_2_o, x_norm_2_threshold, # x_norm_2
+            gate_o, gate_threshold, # gate
+            up_o, up_threshold, # up
+            fn_o, fn_threshold, # fn
+            hadamard_o, hadamard_threshold, # hadamard
             gate_lora_a, up_lora_a, down_lora_a,
             ### weights (attention) ###
             norm_weight_1, norm_bias_1,
@@ -330,22 +319,20 @@ class FusedLlamaLayerFunc(torch.autograd.Function):
             w_up_quant_state,
             w_down_quant_state,
         )
-        ctx.input_layernorm_channel = x_channel_idx 
-        ctx.post_layernorm_channel = x_medium_channel_idx
         ctx.num_heads = num_heads
         ctx.block_size = block_size
         ctx.num_warps = num_warps
         ctx.head_dim = head_dim
-        ctx.q_bit = q_bit
         ctx.lora_scale = lora_scale
+        ctx.shape_1 = x_out.shape
 
-        return x_out, x_channel_idx, x_scale, \
-            x_norm_1_scale, \
-            q_scale, k_scale, v_scale, \
-            a_threshold, o_scale, \
-            x_medium_channel_idx, x_medium_scale, \
-            x_norm_2_scale, \
-            gate_scale, up_scale, fn_scale, hadamard_scale
+        return x_out, x_threshold, \
+            x_norm_1_threshold, \
+            q_threshold, k_threshold, v_threshold, \
+            a_threshold, o_threshold, \
+            x_medium_threshold, x_medium_threshold, \
+            x_norm_2_threshold, \
+            gate_threshold, up_threshold, fn_threshold, hadamard_threshold
     
     @staticmethod
     def backward(ctx, grad_output: torch.Tensor, *args):
@@ -361,25 +348,25 @@ class FusedLlamaLayerFunc(torch.autograd.Function):
         
         (
             ### buffered activation (attention) ###
-            x_o, x_q, x_scale, # x
+            x_o, x_threshold, # x
             mean_1, rstd_1, # buffer for rmsnorm
-            x_norm_1_q, x_norm_1_scale, # x_norm_1
+            x_norm_1_o, x_norm_1_threshold, # x_norm_1
             cos, sin, # buffer for rope
-            q_q, q_scale, # q
-            k_q, k_scale, # k
-            v_q, v_scale, # v
+            q_o, q_threshold, # q
+            k_o, k_threshold, # k
+            v_o, v_threshold, # v
             a_o, a_threshold, # a
-            o_q, o_scale, # o
+            o_o, o_threshold, # o
             q_lora_a, k_lora_a, v_lora_a, # buffer for lora (qkv)
             o_final_lora_a, # buffer for lora (o)
             ### buffered activation (mlp) ###
             mean_2, rstd_2, # buffer for rmsnorm
-            x_medium_o, x_medium_q, x_medium_scale, # x_medium
-            x_norm_2_q, x_norm_2_scale, # x_norm_2
-            gate_q, gate_scale, # gate
-            up_q, up_scale, # up
-            fn_q, fn_scale, # fn
-            hadamard_q, hadamard_scale, # hadamard
+            x_medium_o, x_medium_threshold, # x_medium
+            x_norm_2_o, x_norm_2_threshold, # x_norm_2
+            gate_o, gate_threshold, # gate
+            up_o, up_threshold, # up
+            fn_o, fn_threshold, # fn
+            hadamard_o, hadamard_threshold, # hadamard
             gate_lora_a, up_lora_a, down_lora_a,
             ### weights (attention) ###
             norm_weight_1, norm_bias_1,
@@ -395,17 +382,17 @@ class FusedLlamaLayerFunc(torch.autograd.Function):
         ) = ctx.saved_tensors
         
         #* dequantize hadamard
-        hadamard = decompression_dequantization(hadamard_q, hadamard_scale, ctx.q_bit)
-        del hadamard_q, hadamard_scale
+        hadamard = decompress_structed_pruning(hadamard_o, hadamard_threshold, ctx.shape_2)
+        del hadamard_o
         
         # down proj part
         grad_w_down_lora_a, grad_w_down_lora_b, grad_down = lora_backward(w_down, w_down_quant_state, w_down_lora_a, w_down_lora_b, hadamard, down_lora_a, grad_output, ctx.lora_scale)
         del hadamard
         
         #* dequantize up
-        up = decompression_dequantization(up_q, up_scale, ctx.q_bit)
-        fn = decompression_dequantization(fn_q, fn_scale, ctx.q_bit)
-        del up_q, up_scale, fn_q, fn_scale
+        up = decompress_structed_pruning(up_o, up_threshold, ctx.shape_2)
+        fn = decompress_structed_pruning(fn_o, fn_threshold, ctx.shape_2)
+        del up_o, fn_o
         
         # hadamard
         grad_hadamard_1 = grad_down * up
@@ -413,13 +400,13 @@ class FusedLlamaLayerFunc(torch.autograd.Function):
         del grad_down, up, fn
         
         #* dequantize gate
-        gate = decompression_dequantization(gate_q, gate_scale, ctx.q_bit)
+        gate = decompress_structed_pruning(gate_o, gate_threshold, ctx.shape_2)
         grad_fn = silu_backward(gate, grad_hadamard_1)
-        del gate_q, gate_scale, gate, grad_hadamard_1
+        del gate_o, gate, grad_hadamard_1
         
         #* dequantize x_norm_2
-        x_norm_2 = decompression_dequantization(x_norm_2_q, x_norm_2_scale, ctx.q_bit)
-        del x_norm_2_q, x_norm_2_scale
+        x_norm_2 = decompress_structed_pruning(x_norm_2_o, x_norm_2_threshold, ctx.shape_1)
+        del x_norm_2_o
         
         # gate proj part
         grad_w_gate_lora_a, grad_w_gate_lora_b, grad_gate = lora_backward(w_gate, w_gate_quant_state, w_gate_lora_a, w_gate_lora_b, x_norm_2, gate_lora_a, grad_fn, ctx.lora_scale)
@@ -431,8 +418,8 @@ class FusedLlamaLayerFunc(torch.autograd.Function):
         del grad_up, grad_gate, grad_hadamard_2
         
         #* dequantize x_medium
-        x_medium = outlier_addition_fuse_decompression_dequantization(x_medium_q, x_medium_scale, x_medium_o, ctx.post_layernorm_channel, ctx.q_bit)
-        del x_medium_q, x_medium_scale, x_medium_o
+        x_medium = decompress_structed_pruning(x_medium_o, x_medium_threshold, ctx.shape_1)
+        del x_medium_o
         
         # layernorm & rmsnorm backward
         grad_norm_2, _ = rmsnorm_backward(
@@ -445,8 +432,8 @@ class FusedLlamaLayerFunc(torch.autograd.Function):
         grad_medium = grad_norm_2 + grad_output
         
         #* dequantize o
-        o = decompression_dequantization(o_q, o_scale, ctx.q_bit)
-        del o_q, o_scale
+        o = decompress_structed_pruning(o_o, o_threshold, ctx.shape_1)
+        del o_o
         
         # o part
         grad_w_o_lora_a, grad_w_o_lora_b, grad_o = lora_backward(w_o, w_o_quant_state, w_o_lora_a, w_o_lora_b, o, o_final_lora_a, grad_medium, ctx.lora_scale)
@@ -457,8 +444,9 @@ class FusedLlamaLayerFunc(torch.autograd.Function):
         
         #* dequantize a
         a = a_o.to_dense()
-        v = decompression_dequantization(v_q, v_scale, ctx.q_bit, is_head=True, num_heads=ctx.num_heads)
-        del a_o, v_q, v_scale
+        v = decompress_structed_pruning(v_o, v_threshold, ctx.shape_1)
+        v = hidden_to_head_shape(v, ctx.num_heads)
+        del a_o, v_o
         
         # backward of second GEMM: O = A @ V
         # d L / d V = A.T @ d L / d O
@@ -474,8 +462,10 @@ class FusedLlamaLayerFunc(torch.autograd.Function):
         grad_s = grad_s / math.sqrt(ctx.head_dim)
         
         #* dequantize q
-        q = decompression_dequantization(q_q, q_scale, ctx.q_bit, is_head=True, num_heads=ctx.num_heads)
-        k = decompression_dequantization(k_q, k_scale, ctx.q_bit, is_head=True, num_heads=ctx.num_heads)
+        q = decompress_structed_pruning(q_o, q_threshold, ctx.shape_1)
+        q = hidden_to_head_shape(q, ctx.num_heads)
+        k = decompress_structed_pruning(k_o, k_threshold, ctx.shape_1)
+        k = hidden_to_head_shape(k, ctx.num_heads)
         # d L / d K = (d L / d S)^T @ Q
         grad_k = grad_s.transpose(-2, -1) @ q
         # d L / d Q = d L / d S @ K
@@ -492,8 +482,8 @@ class FusedLlamaLayerFunc(torch.autograd.Function):
         grad_v = head_to_hidden_shape(grad_v)
         
         #* dequantize x_norm_1
-        x_norm_1 = decompression_dequantization(x_norm_1_q, x_norm_1_scale, ctx.q_bit)
-        del x_norm_1_q, x_norm_1_scale
+        x_norm_1 = decompress_structed_pruning(x_norm_1_o, x_norm_1_threshold, ctx.shape_1)
+        del x_norm_1_o
         
         # backward of q_proj
         grad_w_q_lora_a, grad_w_q_lora_b, grad_x = lora_backward(w_q, w_q_quant_state, w_q_lora_a, w_q_lora_b, x_norm_1, q_lora_a, grad_q, ctx.lora_scale)
@@ -507,8 +497,8 @@ class FusedLlamaLayerFunc(torch.autograd.Function):
         grad_x += grad_x_temp
         
         #* dequantize x
-        x = outlier_addition_fuse_decompression_dequantization(x_q, x_scale, x_o, ctx.input_layernorm_channel, ctx.q_bit)
-        del x_q, x_scale, x_o
+        x = decompress_structed_pruning(x_o, x_threshold, ctx.shape_1)
+        del x_o
         
         # layernorm or rmsnorm backward
         grad_norm_1, _ = rmsnorm_backward(
@@ -572,7 +562,7 @@ class FusedLlamaLayerFunc(torch.autograd.Function):
             None,
             grad_w_down_lora_a,
             grad_w_down_lora_b
-        ) + (None,) * 10
+        ) + (None,) * 9
 
 
 class FusedLlamaLayer(torch.nn.Module):
@@ -586,25 +576,24 @@ class FusedLlamaLayer(torch.nn.Module):
         self.num_heads = num_heads
         self.iteration = 0
         self.iteration_threshold = 5
-        self.softmax_outlier_ratio = 0.05
-        self.layernorm_outlier_ratio = 0
-        self.q_bit = 2
+        self.outlier_ratio = 0.25
+        self.softmax_outlier_ratio = 0.25
         self.static_value = {
-            'x': {'outlier_channel_index': None, 'scale': None},
-            'x_norm_1': {'scale': None},
-            'q': {'scale': None},
-            'k': {'scale': None},
-            'v': {'scale': None},
+            'x': {'outlier_channel_index': None},
+            'x_norm_1': {'outlier_channel_index': None},
+            'q': {'outlier_channel_index': None},
+            'k': {'outlier_channel_index': None},
+            'v': {'outlier_channel_index': None},
             'a': {'outlier': None},
-            'o': {'scale': None},
-            'x_medium': {'outlier_channel_index': None, 'scale': None},
-            'x_norm_2': {'scale': None},
-            'gate': {'scale': None},
-            'up': {'scale': None},
-            'fn': {'scale': None},
-            'hadamard': {'scale': None},
+            'o': {'outlier_channel_index': None},
+            'x_medium': {'outlier_channel_index': None},
+            'x_norm_2': {'outlier_channel_index': None},
+            'gate': {'outlier_channel_index': None},
+            'up': {'outlier_channel_index': None},
+            'fn': {'outlier_channel_index': None},
+            'hadamard': {'outlier_channel_index': None},
         }
-        print(f'FusedLlamaLayer(no reorder): softmax_outlier_ratio={self.softmax_outlier_ratio}, layernorm_outlier_ratio={self.layernorm_outlier_ratio}, q_bit={self.q_bit}')
+        print(f'FusedLlamaLayer(no reorder): softmax_outlier_ratio={self.softmax_outlier_ratio}')
         
     def forward(
         self,
@@ -644,13 +633,13 @@ class FusedLlamaLayer(torch.nn.Module):
         head_dim: int,
         lora_scale: float,
     ):
-        y, x_channel_idx, x_scale, \
-        x_norm_1_scale, \
-        q_scale, k_scale, v_scale, \
-        a_threshold, o_scale, \
-        x_medium_channel_idx, x_medium_scale, \
-        x_norm_2_scale, \
-        gate_scale, up_scale, fn_scale, hadamard_scale = FusedLlamaLayerFunc.apply(
+        y, x_threshold, \
+        x_norm_1_threshold, \
+        q_threshold, k_threshold, v_threshold, \
+        a_threshold, o_threshold, \
+        x_medium_threshold, x_medium_threshold, \
+        x_norm_2_threshold, \
+        gate_threshold, up_threshold, fn_threshold, hadamard_threshold = FusedLlamaLayerFunc.apply(
             input,
             #############attention part#############
             norm_weight_1,
@@ -713,25 +702,23 @@ class FusedLlamaLayer(torch.nn.Module):
             self.iteration_threshold,
             self.static_value,
             self.softmax_outlier_ratio,
-            self.layernorm_outlier_ratio,
-            self.q_bit,
+            self.outlier_ratio,
         )
         
         if self.iteration < self.iteration_threshold:
-            self.static_value['x'] = update_dict(self.static_value['x'], {'outlier_channel_index': x_channel_idx, 'scale': x_scale}, self.iteration)
-            self.static_value['x_norm_1'] = update_dict(self.static_value['x_norm_1'], {'scale': x_norm_1_scale}, self.iteration)
-            self.static_value['q'] = update_dict(self.static_value['q'], {'scale': q_scale}, self.iteration)
-            self.static_value['k'] = update_dict(self.static_value['k'], {'scale': k_scale}, self.iteration)
-            self.static_value['v'] = update_dict(self.static_value['v'], {'scale': v_scale}, self.iteration)
+            self.static_value['x'] = update_dict(self.static_value['x'], {'outlier_channel_index': x_threshold}, self.iteration)
+            self.static_value['x_norm_1'] = update_dict(self.static_value['x_norm_1'], {'outlier_channel_index': x_norm_1_threshold}, self.iteration)
+            self.static_value['q'] = update_dict(self.static_value['q'], {'outlier_channel_index': q_threshold}, self.iteration)
+            self.static_value['k'] = update_dict(self.static_value['k'], {'outlier_channel_index': k_threshold}, self.iteration)
+            self.static_value['v'] = update_dict(self.static_value['v'], {'outlier_channel_index': v_threshold}, self.iteration)
             self.static_value['a'] = update_dict(self.static_value['a'], {'outlier': a_threshold}, self.iteration)
-            self.static_value['o'] = update_dict(self.static_value['o'], {'scale': o_scale}, self.iteration)
-            self.static_value['x_medium'] = update_dict(self.static_value['x_medium'], {'outlier_channel_index': x_medium_channel_idx, 'scale': x_medium_scale}, self.iteration)
-            self.static_value['x_norm_2'] = update_dict(self.static_value['x_norm_2'], {'scale': x_norm_2_scale}, self.iteration)
-            self.static_value['gate'] = update_dict(self.static_value['gate'], {'scale': gate_scale}, self.iteration)
-            self.static_value['up'] = update_dict(self.static_value['up'], {'scale': up_scale}, self.iteration)
-            self.static_value['fn'] = update_dict(self.static_value['fn'], {'scale': fn_scale}, self.iteration)
-            self.static_value['hadamard'] = update_dict(self.static_value['hadamard'], {'scale': hadamard_scale}, self.iteration)
-            
+            self.static_value['o'] = update_dict(self.static_value['o'], {'outlier_channel_index': o_threshold}, self.iteration)
+            self.static_value['x_medium'] = update_dict(self.static_value['x_medium'], {'outlier_channel_index': x_medium_threshold}, self.iteration)
+            self.static_value['x_norm_2'] = update_dict(self.static_value['x_norm_2'], {'outlier_channel_index': x_norm_2_threshold}, self.iteration)
+            self.static_value['gate'] = update_dict(self.static_value['gate'], {'outlier_channel_index': gate_threshold}, self.iteration)
+            self.static_value['up'] = update_dict(self.static_value['up'], {'outlier_channel_index': up_threshold}, self.iteration)
+            self.static_value['fn'] = update_dict(self.static_value['fn'], {'outlier_channel_index': fn_threshold}, self.iteration)
+            self.static_value['hadamard'] = update_dict(self.static_value['hadamard'], {'outlier_channel_index': hadamard_threshold}, self.iteration)
         self.iteration += 1
         
         return y

@@ -33,45 +33,6 @@ def get_statistics_softmax(x: torch.Tensor, outlier_ratio: float):
 
 
 @torch.no_grad
-def compress_unstructed_pruning(x: torch.Tensor, outlier: float):
-    mask = (x.abs() > outlier)
-    x_outlier = x * mask
-    x_outlier_sparse = x_outlier.to_sparse()
-    return x_outlier_sparse
-
-
-@torch.no_grad
-def decompress_unstructed_pruning(x_sparse: torch.Tensor):
-    return x_sparse.to_dense()
-
-
-@torch.no_grad
-def get_statistics_outlier(x: torch.Tensor, outlier_ratio: float):
-    outlier = torch.kthvalue(x.float().abs().flatten(), int(x.numel() * (1 - outlier_ratio))).values
-    return outlier
-
-
-@torch.no_grad
-def compress_structed_pruning(x: torch.Tensor, channel_idx: torch.Tensor):
-    x_outlier = x[:, :, channel_idx]
-    return x_outlier, channel_idx
-
-
-@torch.no_grad
-def decompress_structed_pruning(x_outlier: torch.Tensor, channel_idx: torch.Tensor, x_shape: torch.Tensor):
-    x = torch.zeros(x_shape, device=x_outlier.device, dtype=x_outlier.dtype)
-    x[:, :, channel_idx] = x_outlier
-    return x
-
-
-@torch.no_grad
-def get_statistics_structed_pruning(x: torch.Tensor, outlier_ratio: float):
-    channel_norm = x.abs().norm(dim=-2)
-    outlier_channel_index = torch.topk(channel_norm, int(x.shape[-1] * outlier_ratio), largest=True).indices
-    return outlier_channel_index
-
-
-@torch.no_grad
 def pad_cut_L(src_L, tgt_L_len):
     seq_len_1, r = src_L.shape
     seq_len_2 = tgt_L_len
@@ -121,6 +82,28 @@ def get_statistics_only_quant(x: torch.Tensor, q_bit: int = 8, q_method: str = '
     del x
 
     return scale.to(torch.bfloat16)
+
+
+@torch.no_grad
+def get_statistics_only_quant_zero_point(x: torch.Tensor, q_bit: int = 8, q_method: str = 'per-tensor'):
+    if len(x.shape) == 4:
+        batch, num_head, seq_len, sep_dim = x.shape
+        x = x.permute(0, 2, 1, 3).reshape(batch, seq_len, num_head * sep_dim)
+
+    x_sample = x[0]
+    if q_method == 'per-tensor':
+        # TODO: set the scale factor to per channel or per tensor?
+        scale = (x_sample.max() - x_sample.min()) / (2 ** q_bit - 1)
+    elif q_method == 'per-channel':
+        # channel dimension: -2
+        scale = (x_sample.max(dim=-2, keepdim=True).values - x_sample.min(dim=-2, keepdim=True).values) / (2 ** q_bit - 1)
+        zero_point = -torch.round(x_sample.min(dim=-2, keepdim=True).values / scale) - (2 ** (q_bit - 1))
+    else:
+        raise "Unsupport Quantize Method"
+    
+    del x
+
+    return scale.to(torch.bfloat16), zero_point.to(torch.int8)
 
 
 @torch.no_grad
@@ -418,6 +401,76 @@ def decompression_dequantization(q, s, quantize_bit=8, is_head=False, num_heads=
     return x
 
 
+@torch.no_grad
+def compression_quantization_with_zero_point(x, s, z, quantize_bit=8, dtype=torch.bfloat16):
+    # Change shape if need
+    is_head = len(x.shape) == 4
+    if is_head:
+        x = head_to_hidden_shape(x)
+
+    # decide dtype
+    x, s, z = x.to(dtype), s.to(dtype), z.to(dtype)
+    B, M, N = x.shape
+
+    # 1D launch kernel where each block gets its own program.
+    grid = lambda META: (
+        triton.cdiv(M, META['BLOCK_SIZE_M']) * triton.cdiv(N, META['BLOCK_SIZE_N']), B
+    )
+    elem_per_position = 8 // quantize_bit
+    x_temp = torch.empty((B, M, N), device=x.device, dtype=torch.bfloat16)
+    q = torch.empty((B, M, N // elem_per_position), device=x.device, dtype=torch.uint8)
+    
+    # quantize the rest part
+    compression_quantization_with_zero_point_kernel[grid](
+        x, q, x_temp, s, z, 
+        B, M, N,
+        x.stride(0), x.stride(1), x.stride(2),
+        q.stride(0), q.stride(1), q.stride(2),
+        s.stride(0), s.stride(1),
+        z.stride(0), z.stride(1),
+        quantize_bit, elem_per_position
+    )
+
+    del x
+    return q
+
+
+@torch.no_grad
+def decompression_dequantization_with_zero_point(q, s, z, quantize_bit=8, is_head=False, num_heads=1, dtype=torch.bfloat16):
+    B, M, _ = q.shape
+    N = s.shape[-1]
+
+    # dtype
+    s = s.to(dtype)
+    z = z.to(dtype)
+
+    # 1D launch kernel where each block gets its own program.
+    elem_per_position = 8 // quantize_bit
+    grid = lambda META: (
+        triton.cdiv(M, META['BLOCK_SIZE_M']) * triton.cdiv(N, META['BLOCK_SIZE_N']), B
+    )
+    x = torch.empty((B, M, N), device=q.device, dtype=torch.bfloat16)
+    x_temp = torch.empty((B, M, N), device=q.device, dtype=torch.uint8)
+
+    decompression_dequantization_with_zero_point_kernel[grid](
+        x, x_temp, q, s, z,
+        B, M, N,
+        x.stride(0), x.stride(1), x.stride(2),
+        x_temp.stride(0), x_temp.stride(1), x_temp.stride(2),
+        q.stride(0), q.stride(1), q.stride(2),
+        s.stride(0), s.stride(1),
+        z.stride(0), z.stride(1),
+        quantize_bit, elem_per_position,
+    )
+    del x_temp
+    
+    if is_head:
+        x = hidden_to_head_shape(x, num_heads=num_heads)
+    
+    return x
+
+
+
 def compress_pack_channel_base(x, o_ratio, q_bit, q_method, it_num, it_num_thd, static_value):
     if it_num < it_num_thd:
         o_channel_idx, scale = get_statistics_channel_base(x, o_ratio, q_bit, q_method)
@@ -454,22 +507,13 @@ def compress_pack_quant_base(x, q_bit, q_method, it_num, it_num_thd, static_valu
     return q, scale
 
 
-def compress_pack_unstructed_pruning_base(x, o_ratio, it_num, it_num_thd, static_value):
+def compress_pack_quant_zp_base(x, q_bit, q_method, it_num, it_num_thd, static_value):
     if it_num < it_num_thd:
-        outlier = get_statistics_outlier(x, o_ratio) # a funny reuse
+        scale, zero_point = get_statistics_only_quant_zero_point(x, q_bit, q_method)
     else:
-        outlier = static_value['outlier']
-    x_outlier = compress_unstructed_pruning(x, outlier)
-    return x_outlier, outlier
-
-
-def compress_pack_structed_pruning_base(x, channel_ratio, it_num, it_num_thd, static_value):
-    if it_num < it_num_thd:
-        channel_idx = get_statistics_structed_pruning(x, channel_ratio)
-    else:
-        channel_idx = static_value['outlier_channel_index']
-    x_outlier, channel_idx = compress_structed_pruning(x, channel_idx)
-    return x_outlier, channel_idx
+        scale, zero_point = static_value['scale'], static_value['zero_point']
+    q = compression_quantization_with_zero_point(x, scale, zero_point, q_bit)
+    return q, scale, zero_point
 
 
 def compute_overhead(overhead_ratio, x, q_bit):

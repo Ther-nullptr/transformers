@@ -542,6 +542,7 @@ class FusedMistralLayer(torch.nn.Module):
         num_heads: int,
         num_k_heads: int,
         head_dim: int,
+        lora_alpha: int
     ):
         y = FusedMistralLayerFunc.apply(
             input,

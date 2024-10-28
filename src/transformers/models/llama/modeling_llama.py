@@ -50,7 +50,7 @@ from ...utils import (
 from ...utils.import_utils import is_torch_fx_available
 from .configuration_llama import LlamaConfig
 
-from .layer2_select_quant import FusedLlamaLayer
+from .layer2_reorder_compress import FusedLlamaLayer
 
 if is_flash_attn_2_available():
     from flash_attn import flash_attn_func, flash_attn_varlen_func
@@ -115,7 +115,7 @@ class LlamaGEMM(nn.Module):
         self.attention_first = attention_first
 
     def forward(self, x1, x2):
-        return x1 @ x2
+        return torch.matmul(x1, x2)
 
 
 class LlamaFlashAttention(nn.Module):
@@ -442,7 +442,7 @@ class LlamaAttention(nn.Module):
         key_states = repeat_kv(key_states, self.num_key_value_groups)
         value_states = repeat_kv(value_states, self.num_key_value_groups)
 
-        attn_weights = self.gemm1(query_states, key_states.transpose(2, 3)) / math.sqrt(self.head_dim)
+        attn_weights = torch.matmul(query_states, key_states.transpose(2, 3)) / math.sqrt(self.head_dim)
 
         if attn_weights.size() != (bsz, self.num_heads, q_len, kv_seq_len):
             raise ValueError(
@@ -460,7 +460,7 @@ class LlamaAttention(nn.Module):
         # upcast attention to fp32
         attn_weights = self.softmax(attn_weights).to(query_states.dtype)
         attn_weights = nn.functional.dropout(attn_weights, p=self.attention_dropout, training=self.training)
-        attn_output = self.gemm2(attn_weights, value_states)
+        attn_output = torch.matmul(attn_weights, value_states)
 
         if attn_output.size() != (bsz, self.num_heads, q_len, self.head_dim):
             raise ValueError(
@@ -778,13 +778,14 @@ class LlamaDecoderLayer(nn.Module):
         super().__init__()
         self.hidden_size = config.hidden_size
         self.num_attention_heads = config.num_attention_heads
+        
         self.self_attn = LlamaAttention(config=config, layer_idx=layer_idx)
-
         self.mlp = LlamaMLP(config)
         self.input_layernorm = LlamaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.post_attention_layernorm = LlamaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         
         self.fused_llama_layer = FusedLlamaLayer(config.hidden_size, config.num_attention_heads)
+        self.layer_idx = layer_idx
         
     def forward(
         self,
@@ -801,7 +802,6 @@ class LlamaDecoderLayer(nn.Module):
             hidden_states_fake = hidden_states.view(batch, self.num_attention_heads, seq_len, self.hidden_size // self.num_attention_heads)
             cos, sin = self.self_attn.rotary_emb.forward(hidden_states_fake, seq_len)
             del hidden_states_fake
-            
             outputs = self.fused_llama_layer.forward(
                 hidden_states,
                 self.input_layernorm.weight,
@@ -834,6 +834,7 @@ class LlamaDecoderLayer(nn.Module):
                 attention_mask,
                 self.num_attention_heads,
                 self.hidden_size // self.num_attention_heads,
+                self.self_attn.q_proj.scaling['default']
             )
             return (outputs, )
         

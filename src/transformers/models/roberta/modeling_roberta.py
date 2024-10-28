@@ -51,7 +51,7 @@ from flash_attn.bert_padding import index_first_axis, index_put_first_axis
 import torch.nn.functional as F
 from einops import rearrange
 
-from .roberta_layer import FusedRobertaLayer
+from .roberta_reorder import FusedRobertaLayer
 
 logger = logging.get_logger(__name__)
 
@@ -1598,7 +1598,7 @@ class RobertaClassificationHead(nn.Module):
     def forward(self, features, **kwargs):
         x = features[:, 0, :]  # take <s> token (equiv. to [CLS])
         x = self.dropout(x)
-        x = self.class_intermediate(x.to(torch.float32))
+        x = self.class_intermediate(x.to(self.class_intermediate.weight.dtype))
         x = torch.tanh(x)
         x = self.dropout(x)
         x = self.out_proj(x)

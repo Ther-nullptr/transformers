@@ -9,6 +9,14 @@ from .layernorm_kernels import layernorm_forward, layernorm_backward
 from .gelu_kernels import gelu_backward
 from .softmax_kernels import softmax_backward
 
+from .compress_function import (
+    compress_pack_channel_base,
+    compress_pack_quant_base,
+    compress_pack_softmax_base,
+    outlier_addition_fuse_decompression_dequantization,
+    decompression_dequantization,
+    update_dict,
+)
 
 def hidden_to_head_shape(x: torch.Tensor, num_heads: int):
     bsz, seq_len, hidden_dim = x.shape
@@ -22,6 +30,7 @@ def head_to_hidden_shape(x: torch.Tensor):
 
 
 def lora_forward(w, w_quant_state, w_lora_a, w_lora_b, b, x):
+    w_quant_state.dtype = torch.bfloat16
     w_dequant = BF.dequantize_nf4(w, w_quant_state).t()
     x = x.to(w_dequant.dtype)
     x_main = x @ w_dequant + b.to(w_dequant.dtype) if b is not None else x @ w_dequant
@@ -32,6 +41,7 @@ def lora_forward(w, w_quant_state, w_lora_a, w_lora_b, b, x):
 
 
 def lora_backward(w, w_quant_state, w_lora_a, w_lora_b, x, x_lora_a, grad_y):
+    w_quant_state.dtype = torch.bfloat16
     w_dequant = BF.dequantize_nf4(w, w_quant_state).t()
     w_lora_a, w_lora_b = w_lora_a.to(w_dequant.dtype), w_lora_b.to(w_dequant.dtype)
     grad_w_lora_a = x.to(w_dequant.dtype).mT @ (grad_y.to(w_dequant.dtype) @ w_lora_b.mT)
@@ -91,17 +101,31 @@ class FusedRobertaLayerFunc(torch.autograd.Function):
         ###############other################
         attention_mask: torch.Tensor,
         num_heads: int,
-        head_dim: int
+        head_dim: int,
+        ###############about statistics################
+        iteration: int,
+        iteration_threshold: int,
+        static_value: dict,
+        softmax_outlier_ratio: float,
+        layernorm_outlier_ratio: float,
+        q_bit: int,
     ): 
         # compute q,k,v
         # forward process: q_proj
-        q, q_main, q_lora_a = lora_forward(w_q, w_q_quant_state, w_q_lora_a, w_q_lora_b, b_q, x)
+        q, _, q_lora_a = lora_forward(w_q, w_q_quant_state, w_q_lora_a, w_q_lora_b, b_q, x)
         
         # forward process: k_proj
-        k, k_main, k_lora_a = lora_forward(w_k, w_k_quant_state, w_k_lora_a, w_k_lora_b, b_k, x)
+        k, _, k_lora_a = lora_forward(w_k, w_k_quant_state, w_k_lora_a, w_k_lora_b, b_k, x)
 
         # forward process: v_proj
-        v, v_main, v_lora_a = lora_forward(w_v, w_v_quant_state, w_v_lora_a, w_v_lora_b, b_v, x)
+        v, _, v_lora_a = lora_forward(w_v, w_v_quant_state, w_v_lora_a, w_v_lora_b, b_v, x)
+        
+        #* compress x
+        x_q, x_scale = compress_pack_quant_base(
+            x=x.clone(), q_bit=q_bit, 
+            q_method='per-channel', it_num=iteration,
+            it_num_thd=iteration_threshold, static_value=static_value['x']
+        )
         
         # reshape
         q = hidden_to_head_shape(q, num_heads)
@@ -110,12 +134,22 @@ class FusedRobertaLayerFunc(torch.autograd.Function):
         
         ctx.q_shape = q.shape
 
-        # q,k,v: [bsz, num_heads, q_len, head_dim]
-        # notice forward process no need to drop heads
-        bsz, num_heads, q_len, head_dim = q.shape
-
         # forward: S = Q @ K.T / sqrt(d_k)
         s = q @ k.transpose(-2, -1) / math.sqrt(head_dim)
+
+        #* compress q, k
+        q_q, q_scale = compress_pack_quant_base(
+            x=q, q_bit=q_bit,
+            q_method='per-channel', it_num=iteration,
+            it_num_thd=iteration_threshold, static_value=static_value['q']
+        )
+        k_q, k_scale = compress_pack_quant_base(
+            x=k, q_bit=q_bit,
+            q_method='per-channel', it_num=iteration,
+            it_num_thd=iteration_threshold, static_value=static_value['k']
+        )
+        del q, k
+        
         # apply mask
         if attention_mask is not None:
             s = s + attention_mask
@@ -126,49 +160,106 @@ class FusedRobertaLayerFunc(torch.autograd.Function):
         # forward: O = A @ V
         o = a @ v
         
+        #* compress a
+        a_o, a_threshold = compress_pack_softmax_base(
+            x=a, o_ratio=softmax_outlier_ratio, it_num=iteration,
+            it_num_thd=iteration_threshold, static_value=static_value['a']
+        )
+        del a
+        
+        #* compress v
+        v_q, v_scale = compress_pack_quant_base(
+            x=v, q_bit=q_bit,
+            q_method='per-channel', it_num=iteration,
+            it_num_thd=iteration_threshold, static_value=static_value['v']
+        )
+        del v
+        
         # reshape
         o = head_to_hidden_shape(o)
 
         # forward process: o_proj
-        o_final, o_final_main, o_final_lora_a = lora_forward(w_o, w_o_quant_state, w_o_lora_a, w_o_lora_b, b_o, o)
+        o_final, _, o_final_lora_a = lora_forward(w_o, w_o_quant_state, w_o_lora_a, w_o_lora_b, b_o, o)
+        
+        #* compress o
+        o_q, o_scale = compress_pack_quant_base(
+            x=o, q_bit=q_bit,
+            q_method='per-channel', it_num=iteration,
+            it_num_thd=iteration_threshold, static_value=static_value['o']
+        )
+        del o
         
         # layernorm or rmsnorm (with residual connection)
         o_final += x
         x_medium, mean_1, rstd_1, _, _ = layernorm_forward(o_final, norm_weight_1, norm_bias_1, eps = 1e-5)
+        
+        o_final_o, o_final_q, o_final_channel_idx, o_final_scale = compress_pack_channel_base(
+            x=o_final, o_ratio=layernorm_outlier_ratio, q_bit=q_bit,
+            q_method='per-channel', it_num=iteration,
+            it_num_thd=iteration_threshold, static_value=static_value['o_final']
+        )
 
         # forward process: up_proj
         up, up_main, up_lora_a = lora_forward(w_up, w_up_quant_state, w_up_lora_a, w_up_lora_b, b_up, x_medium)
         
+        x_medium_q, x_medium_scale = compress_pack_quant_base(
+            x=x_medium, q_bit=q_bit,
+            q_method='per-channel', it_num=iteration,
+            it_num_thd=iteration_threshold, static_value=static_value['x_medium']
+        )
+        
         # activation function
         fn = torch.nn.functional.gelu(up)
+        
+        up_q, up_scale = compress_pack_quant_base(
+            x=up, q_bit=q_bit,
+            q_method='per-channel', it_num=iteration,
+            it_num_thd=iteration_threshold, static_value=static_value['up']
+        )
+        del up
 
         # forward process: down_proj
         down, down_main, down_lora_a = lora_forward(w_down, w_down_quant_state, w_down_lora_a, w_down_lora_b, b_down, fn)
         down += x_medium
+        
+        fn_q, fn_scale = compress_pack_quant_base(
+            x=fn, q_bit=q_bit,
+            q_method='per-channel', it_num=iteration,
+            it_num_thd=iteration_threshold, static_value=static_value['fn']
+        )
+        del fn
+        
         x_out, mean_2, rstd_2, block_size, num_warps = layernorm_forward(down, norm_weight_2, norm_bias_2, eps = 1e-5)
+        
+        down_o, down_q, down_channel_idx, down_scale = compress_pack_channel_base(
+            x=down, o_ratio=layernorm_outlier_ratio, q_bit=q_bit,
+            q_method='per-channel', it_num=iteration,
+            it_num_thd=iteration_threshold, static_value=static_value['down']
+        )
+        del down
         
         ctx.save_for_backward(
             ### activations (attention) ###
-            x, # buffer for q, k, v
+            x_q, x_scale, # buffer for q, k, v
             q_lora_a, # buffer for lora (qkv)
             k_lora_a, # buffer for lora (qkv)
             v_lora_a, # buffer for lora (qkv)
-            q, # buffer for attn
-            k, # buffer for attn
-            v, # buffer for attn
-            a, # buffer for attn
-            o, # buffer for o
+            q_q, q_scale, # q
+            k_q, k_scale, # k
+            v_q, v_scale, # v
+            a_o, a_threshold, # a
+            o_q, o_scale, # o
             o_final_lora_a, # buffer for lora (o)
-            o_final, # buffer for layernorm
+            o_final_o, o_final_q, o_final_scale, # buffer for layernorm
             mean_1, # buffer for layernorm
             rstd_1, # buffer for layernorm
             ### activations (mlp) ###
-            x_medium, # buffer for up
+            x_medium_q, x_medium_scale, # buffer for up
             up_lora_a, # buffer for lora (up)
-            up, # buffer for gelu/silu
-            fn, # buffer for down
+            up_q, up_scale, # up
+            fn_q, fn_scale, # fn
             down_lora_a, # buffer for lora (down)
-            down, # buffer for layernorm
+            down_o, down_q, down_scale, # buffer for layernorm
             mean_2, # buffer for layernorm
             rstd_2, # buffer for layernorm
             ### weights (attention) ###
@@ -221,11 +312,21 @@ class FusedRobertaLayerFunc(torch.autograd.Function):
         ctx.block_size = block_size
         ctx.num_warps = num_warps
         ctx.head_dim = head_dim
+        ctx.q_bit = q_bit
+        ctx.o_final_channel_idx = o_final_channel_idx
+        ctx.down_channel_idx = down_channel_idx
 
-        return x_out
+        return x_out, x_scale, \
+            q_scale, k_scale, v_scale, \
+            a_threshold, o_scale, \
+            o_final_channel_idx, o_final_scale, \
+            x_medium_scale, \
+            up_scale, fn_scale, \
+            down_channel_idx, down_scale
+            
     
     @staticmethod
-    def backward(ctx, grad_output: torch.Tensor):
+    def backward(ctx, grad_output: torch.Tensor, *args):
         (
             w_q_quant_state,
             w_k_quant_state,
@@ -236,26 +337,27 @@ class FusedRobertaLayerFunc(torch.autograd.Function):
         ) = ctx.quant_state
         
         (
-            x, # buffer for q, k, v
+            ### activations (attention) ###
+            x_q, x_scale, # buffer for q, k, v
             q_lora_a, # buffer for lora (qkv)
             k_lora_a, # buffer for lora (qkv)
             v_lora_a, # buffer for lora (qkv)
-            q, # buffer for attn
-            k, # buffer for attn
-            v, # buffer for attn
-            a, # buffer for attn
-            o, # buffer for o
+            q_q, q_scale, # q
+            k_q, k_scale, # k
+            v_q, v_scale, # v
+            a_o, a_threshold, # a
+            o_q, o_scale, # o
             o_final_lora_a, # buffer for lora (o)
-            o_final, # buffer for layernorm
+            o_final_o, o_final_q, o_final_scale, # buffer for layernorm
             mean_1, # buffer for layernorm
             rstd_1, # buffer for layernorm
             ### activations (mlp) ###
-            x_medium, # buffer for up
+            x_medium_q, x_medium_scale, # buffer for up
             up_lora_a, # buffer for lora (up)
-            up, # buffer for gelu/silu
-            fn, # buffer for down
+            up_q, up_scale, # up
+            fn_q, fn_scale, # fn
             down_lora_a, # buffer for lora (down)
-            down, # buffer for layernorm
+            down_o, down_q, down_scale, # buffer for layernorm
             mean_2, # buffer for layernorm
             rstd_2, # buffer for layernorm
             ### weights (attention) ###
@@ -298,31 +400,37 @@ class FusedRobertaLayerFunc(torch.autograd.Function):
         ) = ctx.saved_tensors
         
         # layernorm
+        down = outlier_addition_fuse_decompression_dequantization(down_q, down_scale, down_o, ctx.down_channel_idx, ctx.q_bit)
         grad_layernorm_2, _, _ = layernorm_backward(
             grad_output, down, norm_weight_2, norm_bias_2, mean_2, rstd_2, # TODO: other params
             True, 1e-5, ctx.num_warps, ctx.block_size
         )
         
         # down proj part
+        fn = decompression_dequantization(fn_q, fn_scale, ctx.q_bit)
         grad_w_down_lora_a, grad_w_down_lora_b, grad_down = lora_backward(w_down, w_down_quant_state, w_down_lora_a, w_down_lora_b, fn, down_lora_a, grad_layernorm_2)
         
         # TODO: activation backward
         # activation part
+        up = decompression_dequantization(up_q, up_scale, ctx.q_bit)
         grad_fn = gelu_backward(up, grad_down)
         
         # up proj part
+        x_medium = decompression_dequantization(x_medium_q, x_medium_scale, ctx.q_bit)
         grad_w_up_lora_a, grad_w_up_lora_b, grad_up = lora_backward(w_up, w_up_quant_state, w_up_lora_a, w_up_lora_b, x_medium, up_lora_a, grad_fn)
         
         # residual connection
         grad_medium = grad_layernorm_2 + grad_up
         
         # layernorm
+        o_final = outlier_addition_fuse_decompression_dequantization(o_final_q, o_final_scale, o_final_o, ctx.o_final_channel_idx, ctx.q_bit)
         grad_x_layernorm_1, _, _ = layernorm_backward(
             grad_medium, o_final, norm_weight_1, norm_bias_1, mean_1, rstd_1, # TODO: other params
             True, 1e-5, ctx.num_warps, ctx.block_size
         )
         
         # o part
+        o = decompression_dequantization(o_q, o_scale, ctx.q_bit)
         grad_w_o_lora_a, grad_w_o_lora_b, grad_o = lora_backward(w_o, w_o_quant_state, w_o_lora_a, w_o_lora_b, o, o_final_lora_a, grad_x_layernorm_1)
         
         # reshape
@@ -330,6 +438,8 @@ class FusedRobertaLayerFunc(torch.autograd.Function):
 
         # backward of second GEMM: O = A @ V
         # d L / d V = A.T @ d L / d O
+        a = a_o.to_dense()
+        v = decompression_dequantization(v_q, v_scale, ctx.q_bit, is_head=True, num_heads=ctx.num_heads)
         grad_v = a.transpose(-2, -1) @ grad_o
         grad_a = grad_o @ v.transpose(-2, -1)
 
@@ -337,6 +447,8 @@ class FusedRobertaLayerFunc(torch.autograd.Function):
         grad_s = softmax_backward(a, grad_a)
 
         # backward of first GEMM: S = Q @ K.T / sqrt(d_k)
+        q = decompression_dequantization(q_q, q_scale, ctx.q_bit, is_head=True, num_heads=ctx.num_heads)
+        k = decompression_dequantization(k_q, k_scale, ctx.q_bit, is_head=True, num_heads=ctx.num_heads)
         grad_s = grad_s / math.sqrt(ctx.head_dim)
         # d L / d K = (d L / d S)^T @ Q
         grad_k = grad_s.transpose(-2, -1) @ q
@@ -347,6 +459,7 @@ class FusedRobertaLayerFunc(torch.autograd.Function):
         grad_k = head_to_hidden_shape(grad_k)
         grad_v = head_to_hidden_shape(grad_v)
         
+        x = decompression_dequantization(x_q, x_scale, ctx.q_bit)
         # backward of q_proj
         grad_w_q_lora_a, grad_w_q_lora_b, grad_x = lora_backward(w_q, w_q_quant_state, w_q_lora_a, w_q_lora_b, x, q_lora_a, grad_q)
 
@@ -405,10 +518,11 @@ class FusedRobertaLayerFunc(torch.autograd.Function):
             ####################################
             None,
             None,
-        ) + (None,) * 3
+        ) + (None,) * 9
 
 
 class FusedRobertaLayer(torch.nn.Module):
+    
     def __init__(
         self,
         hidden_dim: int,
@@ -417,6 +531,26 @@ class FusedRobertaLayer(torch.nn.Module):
         super(FusedRobertaLayer, self).__init__()
         self.hidden_dim = hidden_dim
         self.num_heads = num_heads
+        
+        self.iteration = 0
+        self.iteration_threshold = 5
+        self.softmax_outlier_ratio = 0.05
+        self.layernorm_outlier_ratio = 0.005
+        self.q_bit = 2
+
+        self.static_value = {
+            'x': {'scale': None},
+            'q': {'scale': None},
+            'k': {'scale': None},
+            'v': {'scale': None},
+            'a': {'outlier': None},
+            'o': {'scale': None},
+            'o_final': {'outlier_channel_index': None, 'scale': None},
+            'x_medium': {'scale': None},
+            'up': {'scale': None},
+            'fn': {'scale': None},
+            'down': {'outlier_channel_index': None, 'scale': None},
+        }
 
     def forward(
         self,
@@ -451,7 +585,13 @@ class FusedRobertaLayer(torch.nn.Module):
         head_dim: int,
         ############################################
     ):
-        x_out = FusedRobertaLayerFunc.apply(
+        x_out, x_scale, \
+        q_scale, k_scale, v_scale, \
+        a_threshold, o_scale, \
+        o_final_channel_idx, o_final_scale, \
+        x_medium_scale, \
+        up_scale, fn_scale, \
+        down_channel_idx, down_scale = FusedRobertaLayerFunc.apply(
             input,
             #############attention part#############
             q_proj_base.weight,
@@ -499,6 +639,27 @@ class FusedRobertaLayer(torch.nn.Module):
             attention_mask,
             num_heads,
             head_dim,
+            ####################################
+            self.iteration,
+            self.iteration_threshold,
+            self.static_value,
+            self.softmax_outlier_ratio,
+            self.layernorm_outlier_ratio,
+            self.q_bit,
         )
+        
+        if self.iteration < self.iteration_threshold:
+            self.static_value['x'] = update_dict(self.static_value['x'], {'scale': x_scale}, self.iteration)
+            self.static_value['q'] = update_dict(self.static_value['q'], {'scale': q_scale}, self.iteration)
+            self.static_value['k'] = update_dict(self.static_value['k'], {'scale': k_scale}, self.iteration)
+            self.static_value['v'] = update_dict(self.static_value['v'], {'scale': v_scale}, self.iteration)
+            self.static_value['a'] = update_dict(self.static_value['a'], {'outlier': a_threshold}, self.iteration)
+            self.static_value['o'] = update_dict(self.static_value['o'], {'scale': o_scale}, self.iteration)
+            self.static_value['o_final'] = update_dict(self.static_value['o_final'], {'outlier_channel_index': o_final_channel_idx, 'scale': o_final_scale}, self.iteration)
+            self.static_value['x_medium'] = update_dict(self.static_value['x_medium'], {'scale': x_medium_scale}, self.iteration)
+            self.static_value['up'] = update_dict(self.static_value['up'], {'scale': up_scale}, self.iteration)
+            self.static_value['fn'] = update_dict(self.static_value['fn'], {'scale': fn_scale}, self.iteration)
+            self.static_value['down'] = update_dict(self.static_value['down'], {'outlier_channel_index': down_channel_idx, 'scale': down_scale}, self.iteration)
+        self.iteration += 1
         
         return x_out

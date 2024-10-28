@@ -42,19 +42,16 @@ def lora_backward(w, w_quant_state, w_lora_a, w_lora_b, x, x_lora_a, grad_y):
     return grad_w_lora_a, grad_w_lora_b, grad_x
 
 
-def repeat_kv(hidden_states: torch.Tensor, n_rep: int):
+def repeat_kv(hidden_states: torch.Tensor, n_rep: int) -> torch.Tensor:
+    """
+    This is the equivalent of torch.repeat_interleave(x, dim=1, repeats=n_rep). The hidden states go from (batch,
+    num_key_value_heads, seqlen, head_dim) to (batch, num_attention_heads, seqlen, head_dim)
+    """
     batch, num_key_value_heads, slen, head_dim = hidden_states.shape
     if n_rep == 1:
         return hidden_states
     hidden_states = hidden_states[:, :, None, :, :].expand(batch, num_key_value_heads, n_rep, slen, head_dim)
     return hidden_states.reshape(batch, num_key_value_heads * n_rep, slen, head_dim)
-
-
-def repeat_kv_backward(grad_output: torch.Tensor, n_rep: int):
-    batch, expand_num_key_value_heads, slen, head_dim = grad_output.shape
-    num_key_value_heads = expand_num_key_value_heads // n_rep
-    grad_output = grad_output.reshape(batch, num_key_value_heads, n_rep, slen, head_dim)
-    return grad_output.sum(dim=2)
 
 
 class FusedLlamaLayerFunc(torch.autograd.Function):
@@ -144,6 +141,10 @@ class FusedLlamaLayerFunc(torch.autograd.Function):
         # TODO: apply positional encoding
         q = rope_forward(q.transpose(1, 2), cos, sin).transpose(1, 2)
         k = rope_forward(k.transpose(1, 2), cos, sin).transpose(1, 2)
+
+        # q,k,v: [bsz, num_heads, q_len, head_dim]
+        # notice forward process no need to drop heads
+        bsz, num_heads, q_len, head_dim = q.shape
 
         # forward: S = Q @ K.T / sqrt(d_k)
         s = q @ k.transpose(-2, -1) / math.sqrt(head_dim)
@@ -448,25 +449,25 @@ class FusedLlamaLayerFunc(torch.autograd.Function):
             None,
             None,
             None,
-            grad_w_q_lora_a,
+            None,
             grad_w_q_lora_b,
             ####################################
             None,
             None,
             None,
-            grad_w_k_lora_a,
+            None,
             grad_w_k_lora_b,
             ####################################
             None,
             None,
             None,
-            grad_w_v_lora_a,
+            None,
             grad_w_v_lora_b,
             ####################################
             None,
             None,
             None,
-            grad_w_o_lora_a,
+            None,
             grad_w_o_lora_b,
             ####################################
             None,
@@ -475,19 +476,19 @@ class FusedLlamaLayerFunc(torch.autograd.Function):
             None,
             None,
             None,
-            grad_w_gate_lora_a,
+            None,
             grad_w_gate_lora_b,
             ####################################
             None,
             None,
             None,
-            grad_w_up_lora_a,
+            None,
             grad_w_up_lora_b,
             ####################################
             None,
             None,
             None,
-            grad_w_down_lora_a,
+            None,
             grad_w_down_lora_b
         ) + (None,) * 3
 

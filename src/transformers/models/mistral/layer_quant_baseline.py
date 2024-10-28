@@ -31,23 +31,23 @@ def head_to_hidden_shape(x: torch.Tensor):
     return x.transpose(1, 2).reshape(bsz, seq_len, -1)
 
 
-def lora_forward(w, w_quant_state, w_lora_a, w_lora_b, b, x):
+def lora_forward(w, w_quant_state, w_lora_a, w_lora_b, b, x, lora_scale):
     w_dequant = BF.dequantize_nf4(w, w_quant_state).t()
     x = x.to(w_dequant.dtype)
     x_main = x @ w_dequant + b.to(w_dequant.dtype) if b is not None else x @ w_dequant
     x_lora_a = x @ w_lora_a.to(w_dequant.dtype)
     x_lora = x_lora_a @ w_lora_b.to(w_dequant.dtype)
-    x = x_main + x_lora
+    x = x_main + x_lora * lora_scale
     return x, x_main, x_lora_a
 
 
-def lora_backward(w, w_quant_state, w_lora_a, w_lora_b, x, x_lora_a, grad_y):
+def lora_backward(w, w_quant_state, w_lora_a, w_lora_b, x, x_lora_a, grad_y, lora_scale):
     w_dequant = BF.dequantize_nf4(w, w_quant_state).t()
     w_lora_a, w_lora_b = w_lora_a.to(w_dequant.dtype), w_lora_b.to(w_dequant.dtype)
-    grad_w_lora_a = x.to(w_dequant.dtype).mT @ (grad_y.to(w_dequant.dtype) @ w_lora_b.mT)
-    grad_w_lora_b = x_lora_a.mT @ grad_y.to(w_lora_b.dtype)
+    grad_w_lora_a = x.to(w_dequant.dtype).mT @ (grad_y.to(w_dequant.dtype) @ w_lora_b.mT) * lora_scale
+    grad_w_lora_b = (x_lora_a.mT @ grad_y.to(w_lora_b.dtype)) * lora_scale
     grad_x = grad_y.to(w_dequant.dtype) @ w_dequant.T 
-    grad_x += (grad_y.to(w_lora_b.dtype) @ w_lora_b.T @ w_lora_a.T).to(w_dequant.dtype)
+    grad_x += (((grad_y.to(w_lora_b.dtype) @ w_lora_b.T) * lora_scale) @ w_lora_a.T)
     return grad_w_lora_a, grad_w_lora_b, grad_x
 
 
@@ -127,6 +127,7 @@ class FusedMistralLayerFunc(torch.autograd.Function):
         num_heads: int,
         num_k_heads: int, # shrinked heads
         head_dim: int,
+        lora_scale: float,
         ###############about statistics################
         iteration: int,
         iteration_threshold: int,
@@ -148,13 +149,34 @@ class FusedMistralLayerFunc(torch.autograd.Function):
 
         # compute q,k,v
         # forward process: q_proj
-        q, _, q_lora_a = lora_forward(w_q, w_q_quant_state, w_q_lora_a, w_q_lora_b, b_q, x_norm_1)
+        q, _, q_lora_a = lora_forward(w_q, w_q_quant_state, w_q_lora_a, w_q_lora_b, b_q, x_norm_1, lora_scale)
+        
+        # plot q
+        import matplotlib.pyplot as plt
+        import seaborn as sns
+        plt.figure()
+        sns.heatmap(q[0].float().detach().cpu().numpy())
+        plt.savefig('q.png')
+        
+        plt.figure()
+        q_quant = compress_pack_quant_base(
+            x=q, q_bit=q_bit,
+            q_method='per-channel', it_num=iteration,
+            it_num_thd=iteration_threshold, static_value=static_value['q']
+        )
+        q_dequant = decompression_dequantization(q_quant[0], q_quant[1], q_bit)
+        sns.heatmap(q_dequant[0].float().detach().cpu().numpy())
+        plt.savefig('q_dequant.png')
+        
+        plt.figure()
+        sns.heatmap((q[0] - q_dequant[0]).float().detach().cpu().numpy())
+        plt.savefig('q_diff.png')
 
         # forward process: k_proj
-        k, _, k_lora_a = lora_forward(w_k, w_k_quant_state, w_k_lora_a, w_k_lora_b, b_k, x_norm_1)
+        k, _, k_lora_a = lora_forward(w_k, w_k_quant_state, w_k_lora_a, w_k_lora_b, b_k, x_norm_1, lora_scale)
 
         # forward process: v_proj
-        v, _, v_lora_a = lora_forward(w_v, w_v_quant_state, w_v_lora_a, w_v_lora_b, b_v, x_norm_1)
+        v, _, v_lora_a = lora_forward(w_v, w_v_quant_state, w_v_lora_a, w_v_lora_b, b_v, x_norm_1, lora_scale)
         
         #* compress x_norm_1
         x_norm_1_q, x_norm_1_scale = compress_pack_quant_base(
@@ -222,7 +244,7 @@ class FusedMistralLayerFunc(torch.autograd.Function):
         o = head_to_hidden_shape(o)
 
         # forward process: o_proj
-        o_final, _, o_final_lora_a = lora_forward(w_o, w_o_quant_state, w_o_lora_a, w_o_lora_b, b_o, o)
+        o_final, _, o_final_lora_a = lora_forward(w_o, w_o_quant_state, w_o_lora_a, w_o_lora_b, b_o, o, lora_scale)
         
         #* compress o
         o_q, o_scale = compress_pack_quant_base(
@@ -248,10 +270,10 @@ class FusedMistralLayerFunc(torch.autograd.Function):
         )
         
         # forward process: gate_proj
-        gate, _, gate_lora_a = lora_forward(w_gate, w_gate_quant_state, w_gate_lora_a, w_gate_lora_b, b_gate, x_norm_2)
+        gate, _, gate_lora_a = lora_forward(w_gate, w_gate_quant_state, w_gate_lora_a, w_gate_lora_b, b_gate, x_norm_2, lora_scale)
         
         # forward process: up_proj
-        up, _, up_lora_a = lora_forward(w_up, w_up_quant_state, w_up_lora_a, w_up_lora_b, b_up, x_norm_2)
+        up, _, up_lora_a = lora_forward(w_up, w_up_quant_state, w_up_lora_a, w_up_lora_b, b_up, x_norm_2, lora_scale)
 
         #* compress the x_norm_2
         x_norm_2_q, x_norm_2_scale = compress_pack_quant_base(
@@ -290,7 +312,7 @@ class FusedMistralLayerFunc(torch.autograd.Function):
         del fn
             
         # forward process: down_proj
-        down, _, down_lora_a = lora_forward(w_down, w_down_quant_state, w_down_lora_a, w_down_lora_b, b_down, hadamard)
+        down, _, down_lora_a = lora_forward(w_down, w_down_quant_state, w_down_lora_a, w_down_lora_b, b_down, hadamard, lora_scale)
         
         #* compress the hadamard
         hadamard_q, hadamard_scale = compress_pack_quant_base(
@@ -355,6 +377,7 @@ class FusedMistralLayerFunc(torch.autograd.Function):
         ctx.num_warps = num_warps
         ctx.head_dim = head_dim
         ctx.q_bit = q_bit
+        ctx.lora_scale = lora_scale
 
         return x_out, x_channel_idx, x_scale, \
             x_norm_1_scale, \
@@ -416,7 +439,7 @@ class FusedMistralLayerFunc(torch.autograd.Function):
         del hadamard_q, hadamard_scale
         
         # down proj part
-        grad_w_down_lora_a, grad_w_down_lora_b, grad_down = lora_backward(w_down, w_down_quant_state, w_down_lora_a, w_down_lora_b, hadamard, down_lora_a, grad_output)
+        grad_w_down_lora_a, grad_w_down_lora_b, grad_down = lora_backward(w_down, w_down_quant_state, w_down_lora_a, w_down_lora_b, hadamard, down_lora_a, grad_output, ctx.lora_scale)
         del hadamard
         
         #* dequantize up
@@ -439,11 +462,11 @@ class FusedMistralLayerFunc(torch.autograd.Function):
         del x_norm_2_q, x_norm_2_scale
         
         # gate proj part
-        grad_w_gate_lora_a, grad_w_gate_lora_b, grad_gate = lora_backward(w_gate, w_gate_quant_state, w_gate_lora_a, w_gate_lora_b, x_norm_2, gate_lora_a, grad_fn)
+        grad_w_gate_lora_a, grad_w_gate_lora_b, grad_gate = lora_backward(w_gate, w_gate_quant_state, w_gate_lora_a, w_gate_lora_b, x_norm_2, gate_lora_a, grad_fn, ctx.lora_scale)
         del grad_fn
         
         # up proj part
-        grad_w_up_lora_a, grad_w_up_lora_b, grad_up = lora_backward(w_up, w_up_quant_state, w_up_lora_a, w_up_lora_b, x_norm_2, up_lora_a, grad_hadamard_2)
+        grad_w_up_lora_a, grad_w_up_lora_b, grad_up = lora_backward(w_up, w_up_quant_state, w_up_lora_a, w_up_lora_b, x_norm_2, up_lora_a, grad_hadamard_2, ctx.lora_scale)
         grad_gate_up = grad_up + grad_gate
         del grad_up, grad_gate, grad_hadamard_2
         
@@ -466,7 +489,7 @@ class FusedMistralLayerFunc(torch.autograd.Function):
         del o_q, o_scale
         
         # o part
-        grad_w_o_lora_a, grad_w_o_lora_b, grad_o = lora_backward(w_o, w_o_quant_state, w_o_lora_a, w_o_lora_b, o, o_final_lora_a, grad_medium)
+        grad_w_o_lora_a, grad_w_o_lora_b, grad_o = lora_backward(w_o, w_o_quant_state, w_o_lora_a, w_o_lora_b, o, o_final_lora_a, grad_medium, ctx.lora_scale)
         del o
         
         # reshape
@@ -515,14 +538,14 @@ class FusedMistralLayerFunc(torch.autograd.Function):
         del x_norm_1_q, x_norm_1_scale
         
         # backward of q_proj
-        grad_w_q_lora_a, grad_w_q_lora_b, grad_x = lora_backward(w_q, w_q_quant_state, w_q_lora_a, w_q_lora_b, x_norm_1, q_lora_a, grad_q)
+        grad_w_q_lora_a, grad_w_q_lora_b, grad_x = lora_backward(w_q, w_q_quant_state, w_q_lora_a, w_q_lora_b, x_norm_1, q_lora_a, grad_q, ctx.lora_scale)
 
         # backward of k_proj
-        grad_w_k_lora_a, grad_w_k_lora_b, grad_x_temp = lora_backward(w_k, w_k_quant_state, w_k_lora_a, w_k_lora_b, x_norm_1, k_lora_a, grad_k)
+        grad_w_k_lora_a, grad_w_k_lora_b, grad_x_temp = lora_backward(w_k, w_k_quant_state, w_k_lora_a, w_k_lora_b, x_norm_1, k_lora_a, grad_k, ctx.lora_scale)
         grad_x += grad_x_temp
 
         # backward of v_proj
-        grad_w_v_lora_a, grad_w_v_lora_b, grad_x_temp = lora_backward(w_v, w_v_quant_state, w_v_lora_a, w_v_lora_b, x_norm_1, v_lora_a, grad_v)
+        grad_w_v_lora_a, grad_w_v_lora_b, grad_x_temp = lora_backward(w_v, w_v_quant_state, w_v_lora_a, w_v_lora_b, x_norm_1, v_lora_a, grad_v, ctx.lora_scale)
         grad_x += grad_x_temp
         
         #* dequantize x
@@ -591,7 +614,7 @@ class FusedMistralLayerFunc(torch.autograd.Function):
             None,
             grad_w_down_lora_a,
             grad_w_down_lora_b
-        ) + (None,) * 10
+        ) + (None,) * 11
 
 
 class FusedMistralLayer(torch.nn.Module):
@@ -609,7 +632,7 @@ class FusedMistralLayer(torch.nn.Module):
         self.iteration_threshold = 5
         self.softmax_outlier_ratio = 0.05
         self.layernorm_outlier_ratio = 0.005
-        self.q_bit = 4
+        self.q_bit = 8
         self.static_value = {
             'x': {'outlier_channel_index': None, 'scale': None},
             'x_norm_1': {'scale': None},
@@ -625,6 +648,7 @@ class FusedMistralLayer(torch.nn.Module):
             'fn': {'scale': None},
             'hadamard': {'scale': None},
         }
+        print(f'FusedMistralLayer: softmax_outlier_ratio={self.softmax_outlier_ratio}, layernorm_outlier_ratio={self.layernorm_outlier_ratio}, q_bit={self.q_bit}')
         
     def forward(
         self,
@@ -663,6 +687,7 @@ class FusedMistralLayer(torch.nn.Module):
         num_heads: int,
         num_k_heads: int,
         head_dim: int,
+        lora_scale: float,
     ):
         y, x_channel_idx, x_scale, \
         x_norm_1_scale, \
@@ -728,6 +753,7 @@ class FusedMistralLayer(torch.nn.Module):
             num_heads,
             num_k_heads,
             head_dim,
+            lora_scale,
             ####################################
             self.iteration,
             self.iteration_threshold,

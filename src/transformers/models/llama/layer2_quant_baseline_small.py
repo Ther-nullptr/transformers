@@ -51,6 +51,21 @@ def lora_backward(w, w_quant_state, w_lora_a, w_lora_b, x, x_lora_a, grad_y, lor
     return grad_w_lora_a, grad_w_lora_b, grad_x
 
 
+def repeat_kv(hidden_states: torch.Tensor, n_rep: int):
+    batch, num_key_value_heads, slen, head_dim = hidden_states.shape
+    if n_rep == 1:
+        return hidden_states
+    hidden_states = hidden_states[:, :, None, :, :].expand(batch, num_key_value_heads, n_rep, slen, head_dim)
+    return hidden_states.reshape(batch, num_key_value_heads * n_rep, slen, head_dim)
+
+
+def repeat_kv_backward(grad_output: torch.Tensor, n_rep: int):
+    batch, expand_num_key_value_heads, slen, head_dim = grad_output.shape
+    num_key_value_heads = expand_num_key_value_heads // n_rep
+    grad_output = grad_output.reshape(batch, num_key_value_heads, n_rep, slen, head_dim)
+    return grad_output.sum(dim=2)
+
+
 class FusedLlamaLayerFunc(torch.autograd.Function):
     @staticmethod
     def forward(
@@ -151,8 +166,8 @@ class FusedLlamaLayerFunc(torch.autograd.Function):
         
         # reshape
         q = hidden_to_head_shape(q, num_heads)
-        k = hidden_to_head_shape(k, num_heads)
-        v = hidden_to_head_shape(v, num_heads)
+        k = hidden_to_head_shape(k, num_heads // 8)
+        v = hidden_to_head_shape(v, num_heads // 8)
         
         ctx.q_shape = q.shape
 
@@ -160,6 +175,7 @@ class FusedLlamaLayerFunc(torch.autograd.Function):
         k = rope_forward(k.transpose(1, 2), cos, sin).transpose(1, 2)
 
         # forward: S = Q @ K.T / sqrt(d_k)
+        k = repeat_kv(k, n_rep=8)
         s = q @ k.transpose(-2, -1) / math.sqrt(head_dim)
         
         #* compress q, k
@@ -184,6 +200,7 @@ class FusedLlamaLayerFunc(torch.autograd.Function):
         del s
 
         # forward: O = A @ V
+        v = repeat_kv(v, n_rep=8)
         o = a @ v
         
         #* compress a
@@ -464,6 +481,7 @@ class FusedLlamaLayerFunc(torch.autograd.Function):
         # d L / d V = A.T @ d L / d O
         grad_v = a.transpose(-2, -1) @ grad_o
         grad_a = grad_o @ v.transpose(-2, -1)
+        grad_v = repeat_kv_backward(grad_v, n_rep=8)
         del grad_o, v
 
         # backward of softmax
@@ -478,6 +496,7 @@ class FusedLlamaLayerFunc(torch.autograd.Function):
         k = decompression_dequantization(k_q, k_scale, ctx.q_bit, is_head=True, num_heads=ctx.num_heads)
         # d L / d K = (d L / d S)^T @ Q
         grad_k = grad_s.transpose(-2, -1) @ q
+        grad_k = repeat_kv_backward(grad_k, n_rep=8)
         # d L / d Q = d L / d S @ K
         grad_q = grad_s @ k
         del grad_s, q, k
@@ -588,7 +607,7 @@ class FusedLlamaLayer(torch.nn.Module):
         self.iteration_threshold = 5
         self.softmax_outlier_ratio = 0.05
         self.layernorm_outlier_ratio = 0
-        self.q_bit = 2
+        self.q_bit = 4
         self.static_value = {
             'x': {'outlier_channel_index': None, 'scale': None},
             'x_norm_1': {'scale': None},

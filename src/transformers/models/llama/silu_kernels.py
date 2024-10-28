@@ -4,7 +4,7 @@ import triton.language as tl
 
 @triton.autotune(
     configs=[
-        triton.Config({'BLOCK_SIZE_M': 32, 'BLOCK_SIZE_N': 32, 'GROUP_SIZE_M': 8, }, num_stages=2, num_warps=2)
+        triton.Config({'BLOCK_SIZE_M': 32, 'BLOCK_SIZE_N': 32, 'GROUP_SIZE_M': 4, }, num_stages=4, num_warps=8)
     ],
     key=['M', 'N'],
 )
@@ -107,7 +107,7 @@ def triton_silu_hadamard_kernel(
     
 
 # apply silu to x1, then mult with x2
-def triton_silu_hadamard(x, g):
+def silu_hadamard(x, g):
     B, M, N = x.shape
     assert g.shape == x.shape
     

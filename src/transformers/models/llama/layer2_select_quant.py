@@ -42,11 +42,11 @@ def lora_forward(w, w_quant_state, w_lora_a, w_lora_b, b, x):
 
 
 def lora_backward(w, w_quant_state, w_lora_a, w_lora_b, x, x_lora_a, grad_y):
-    w_dequant = BF.dequantize_nf4(w, w_quant_state).t()
+    w_dequant = BF.dequantize_nf4(w, w_quant_state).t().to(torch.bfloat16)
     w_lora_a, w_lora_b = w_lora_a.to(w_dequant.dtype), w_lora_b.to(w_dequant.dtype)
     grad_w_lora_a = x.to(w_dequant.dtype).mT @ (grad_y.to(w_dequant.dtype) @ w_lora_b.mT)
     grad_w_lora_b = x_lora_a.mT @ grad_y.to(w_lora_b.dtype)
-    grad_x = grad_y.to(w_dequant.dtype) @ w_dequant.T 
+    grad_x = grad_y.to(w_dequant.dtype) @ w_dequant.T
     grad_x += (grad_y.to(w_lora_b.dtype) @ w_lora_b.T @ w_lora_a.T)
     return grad_w_lora_a, grad_w_lora_b, grad_x
 
@@ -121,9 +121,9 @@ class FusedLlamaLayerFunc(torch.autograd.Function):
     ):
         # layernorm or rmsnorm
         x_norm_1, mean_1, rstd_1, _, _ = rmsnorm_forward(x, norm_weight_1, eps = 1e-5)
-        
+
         #* compress the (copy of) x
-        if quant_type == 'layernorm':
+        if quant_type == 'layernorm' or quant_type == 'nonlinear':
             x_copy = x.clone()
             x_q, x_scale = compress_pack_quant_base(
                 x=x_copy, q_bit=q_bit,
@@ -140,7 +140,7 @@ class FusedLlamaLayerFunc(torch.autograd.Function):
 
         # forward process: v_proj
         v, _, v_lora_a = lora_forward(w_v, w_v_quant_state, w_v_lora_a, w_v_lora_b, b_v, x_norm_1)
-        
+
         #* compress x_norm_1
         if quant_type == 'linear':
             x_norm_1_q, x_norm_1_scale = compress_pack_quant_base(
@@ -149,12 +149,12 @@ class FusedLlamaLayerFunc(torch.autograd.Function):
                 it_num_thd=iteration_threshold, static_value=static_value['x_norm_1']
             )
             del x_norm_1
-        
+
         # reshape
         q = hidden_to_head_shape(q, num_heads)
         k = hidden_to_head_shape(k, num_heads)
         v = hidden_to_head_shape(v, num_heads)
-        
+
         ctx.q_shape = q.shape
 
         q = rope_forward(q.transpose(1, 2), cos, sin).transpose(1, 2)
@@ -166,9 +166,9 @@ class FusedLlamaLayerFunc(torch.autograd.Function):
 
         # forward: S = Q @ K.T / sqrt(d_k)
         s = q @ k.transpose(-2, -1) / math.sqrt(head_dim)
-        
+
         #* compress q, k
-        if quant_type == 'gemm':
+        if quant_type == 'gemm' or quant_type == 'nonlinear':
             q_q, q_scale = compress_pack_quant_base(
                 x=q, q_bit=q_bit,
                 q_method='per-channel', it_num=iteration,
@@ -180,7 +180,7 @@ class FusedLlamaLayerFunc(torch.autograd.Function):
                 it_num_thd=iteration_threshold, static_value=static_value['k']
             )
             del q, k
-        
+
         # apply mask
         if attention_mask is not None:
             s = s + attention_mask
@@ -191,29 +191,29 @@ class FusedLlamaLayerFunc(torch.autograd.Function):
 
         # forward: O = A @ V
         o = a @ v
-        
+
         #* compress a
         a_o, a_threshold = compress_pack_softmax_base(
             x=a, o_ratio=softmax_outlier_ratio, it_num=iteration,
             it_num_thd=iteration_threshold, static_value=static_value['a']
         )
         del a
-        
+
         #* compress v
-        if quant_type == 'gemm':
+        if quant_type == 'gemm' or quant_type == 'nonlinear':
             v_q, v_scale = compress_pack_quant_base(
                 x=v, q_bit=q_bit,
                 q_method='per-channel', it_num=iteration,
                 it_num_thd=iteration_threshold, static_value=static_value['v']
             )
             del v
-        
+
         # reshape
         o = head_to_hidden_shape(o)
 
         # forward process: o_proj
         o_final, _, o_final_lora_a = lora_forward(w_o, w_o_quant_state, w_o_lora_a, w_o_lora_b, b_o, o)
-        
+
         #* compress o
         if quant_type == 'linear':
             o_q, o_scale = compress_pack_quant_base(
@@ -222,26 +222,26 @@ class FusedLlamaLayerFunc(torch.autograd.Function):
                 it_num_thd=iteration_threshold, static_value=static_value['o']
             )
             del o
-        
+
         # residual connection
         x_medium = x + o_final
-        del x, o_final
-        
+        del o_final
+
         # layernorm or rmsnorm
         x_norm_2, mean_2, rstd_2, block_size, num_warps = rmsnorm_forward(x_medium, norm_weight_2, eps = 1e-5)
-        
+
         #* compress the (copy of) x_medium
         x_medium_copy = x_medium.clone()
-        if quant_type == 'layernorm':
+        if quant_type == 'layernorm' or quant_type == 'nonlinear':
             x_medium_q, x_medium_scale = compress_pack_quant_base(
                 x=x_medium_copy, q_bit=q_bit,
                 q_method='per-channel', it_num=iteration,
                 it_num_thd=iteration_threshold, static_value=static_value['x_medium']
             )
-        
+
         # forward process: gate_proj
         gate, _, gate_lora_a = lora_forward(w_gate, w_gate_quant_state, w_gate_lora_a, w_gate_lora_b, b_gate, x_norm_2)
-        
+
         # forward process: up_proj
         up, _, up_lora_a = lora_forward(w_up, w_up_quant_state, w_up_lora_a, w_up_lora_b, b_up, x_norm_2)
 
@@ -253,24 +253,24 @@ class FusedLlamaLayerFunc(torch.autograd.Function):
                 it_num_thd=iteration_threshold, static_value=static_value['x_norm_2']
             )
             del x_norm_2
-        
+
         # apply activation function (for gate)
         fn = torch.nn.functional.silu(gate)
-        
+
         #* compress the gate
-        if quant_type == 'silu':
+        if quant_type == 'silu' or quant_type == 'nonlinear':
             gate_q, gate_scale = compress_pack_quant_base(
                 x=gate, q_bit=q_bit,
                 q_method='per-channel', it_num=iteration,
                 it_num_thd=iteration_threshold, static_value=static_value['gate']
             )
             del gate
-            
+
         # hadamard
         hadamard = up * fn
-        
+
         #* compress the up / fn
-        if quant_type == 'hadamard':
+        if quant_type == 'hadamard' or quant_type == 'nonlinear':
             up_q, up_scale = compress_pack_quant_base(
                 x=up, q_bit=q_bit,
                 q_method='per-channel', it_num=iteration,
@@ -282,10 +282,10 @@ class FusedLlamaLayerFunc(torch.autograd.Function):
                 it_num_thd=iteration_threshold, static_value=static_value['fn']
             )
             del up, fn
-            
+
         # forward process: down_proj
         down, _, down_lora_a = lora_forward(w_down, w_down_quant_state, w_down_lora_a, w_down_lora_b, b_down, hadamard)
-        
+
         #* compress the hadamard
         if quant_type == 'linear':
             hadamard_q, hadamard_scale = compress_pack_quant_base(
@@ -294,11 +294,11 @@ class FusedLlamaLayerFunc(torch.autograd.Function):
                 it_num_thd=iteration_threshold, static_value=static_value['hadamard']
             )
             del hadamard
-        
+
         # residual connection
         x_out = x_medium + down
-        del x_medium, down
-        
+        del down
+
         if quant_type == 'layernorm':
             ctx.save_for_backward(
                 ### buffered activation (attention) ###
@@ -335,7 +335,7 @@ class FusedLlamaLayerFunc(torch.autograd.Function):
         elif quant_type == 'linear':
             ctx.save_for_backward(
                 ### buffered activation (attention) ###
-                x, 
+                x,
                 mean_1, rstd_1, # buffer for rmsnorm
                 x_norm_1_q, x_norm_1_scale, # x_norm_1
                 cos, sin, # buffer for rope
@@ -368,7 +368,7 @@ class FusedLlamaLayerFunc(torch.autograd.Function):
         elif quant_type == 'gemm':
             ctx.save_for_backward(
                 ### buffered activation (attention) ###
-                x, 
+                x,
                 mean_1, rstd_1, # buffer for rmsnorm
                 x_norm_1, # x_norm_1
                 cos, sin, # buffer for rope
@@ -403,7 +403,7 @@ class FusedLlamaLayerFunc(torch.autograd.Function):
         elif quant_type == 'silu':
             ctx.save_for_backward(
                 ### buffered activation (attention) ###
-                x, 
+                x,
                 mean_1, rstd_1, # buffer for rmsnorm
                 x_norm_1, # x_norm_1
                 cos, sin, # buffer for rope
@@ -436,11 +436,13 @@ class FusedLlamaLayerFunc(torch.autograd.Function):
         elif quant_type == 'hadamard':
             ctx.save_for_backward(
                 ### buffered activation (attention) ###
-                x, 
+                x,
                 mean_1, rstd_1, # buffer for rmsnorm
                 x_norm_1, # x_norm_1
                 cos, sin, # buffer for rope
-                q, k, v, # qkv
+                q_q, q_scale, # q
+                k_q, k_scale, # k
+                v_q, v_scale, # v
                 a_o, a_threshold, # a
                 o, # o
                 q_lora_a, k_lora_a, v_lora_a, # buffer for lora (qkv)
@@ -450,6 +452,41 @@ class FusedLlamaLayerFunc(torch.autograd.Function):
                 x_medium, # x_medium
                 x_norm_2, # x_norm_2
                 gate, # gate
+                up_q, up_scale, # up
+                fn_q, fn_scale, # fn
+                hadamard, # hadamard
+                gate_lora_a, up_lora_a, down_lora_a,
+                ### weights (attention) ###
+                norm_weight_1, norm_bias_1,
+                w_q, b_q, w_q_lora_a, w_q_lora_b,
+                w_k, b_k, w_k_lora_a, w_k_lora_b,
+                w_v, b_v, w_v_lora_a, w_v_lora_b,
+                w_o, b_o, w_o_lora_a, w_o_lora_b,
+                ### weights (mlp) ###
+                norm_weight_2, norm_bias_2,
+                w_gate, b_gate, w_gate_lora_a, w_gate_lora_b,
+                w_up, b_up, w_up_lora_a, w_up_lora_b,
+                w_down, b_down, w_down_lora_a, w_down_lora_b,
+            )
+        elif quant_type == 'nonlinear':
+            ctx.save_for_backward(
+                ### buffered activation (attention) ###
+                x_q, x_scale, # x
+                mean_1, rstd_1, # buffer for rmsnorm
+                x_norm_1, # x_norm_1
+                cos, sin, # buffer for rope
+                q_q, q_scale, # q
+                k_q, k_scale, # k
+                v_q, v_scale, # v
+                a_o, a_threshold, # a
+                o, # o
+                q_lora_a, k_lora_a, v_lora_a, # buffer for lora (qkv)
+                o_final_lora_a, # buffer for lora (o)
+                ### buffered activation (mlp) ###
+                mean_2, rstd_2, # buffer for rmsnorm
+                x_medium_q, x_medium_scale, # x_medium
+                x_norm_2, # x_norm_2
+                gate_q, gate_scale, # gate
                 up_q, up_scale, # up
                 fn_q, fn_scale, # fn
                 hadamard, # hadamard
@@ -492,7 +529,9 @@ class FusedLlamaLayerFunc(torch.autograd.Function):
             return x_out, gate_scale, a_threshold
         elif quant_type == 'hadamard':
             return x_out, up_scale, fn_scale, a_threshold
-    
+        elif quant_type == 'nonlinear':
+            return x_out, x_scale, x_medium_scale, q_scale, k_scale, v_scale, gate_scale, up_scale, fn_scale, a_threshold
+
     @staticmethod
     def backward(ctx, grad_output: torch.Tensor, *args):
         (
@@ -504,7 +543,7 @@ class FusedLlamaLayerFunc(torch.autograd.Function):
             w_up_quant_state,
             w_down_quant_state,
         ) = ctx.quant_state
-        
+
         if ctx.quant_type == 'layernorm':
             (
                 ### buffered activation (attention) ###
@@ -541,7 +580,7 @@ class FusedLlamaLayerFunc(torch.autograd.Function):
         elif ctx.quant_type == 'linear':
             (
                 ### buffered activation (attention) ###
-                x, 
+                x,
                 mean_1, rstd_1, # buffer for rmsnorm
                 x_norm_1_q, x_norm_1_scale, # x_norm_1
                 cos, sin, # buffer for rope
@@ -574,7 +613,7 @@ class FusedLlamaLayerFunc(torch.autograd.Function):
         elif ctx.quant_type == 'gemm':
             (
                 ### buffered activation (attention) ###
-                x, 
+                x,
                 mean_1, rstd_1, # buffer for rmsnorm
                 x_norm_1, # x_norm_1
                 cos, sin, # buffer for rope
@@ -609,7 +648,7 @@ class FusedLlamaLayerFunc(torch.autograd.Function):
         elif ctx.quant_type == 'silu':
             (
                 ### buffered activation (attention) ###
-                x, 
+                x,
                 mean_1, rstd_1, # buffer for rmsnorm
                 x_norm_1, # x_norm_1
                 cos, sin, # buffer for rope
@@ -642,7 +681,7 @@ class FusedLlamaLayerFunc(torch.autograd.Function):
         elif ctx.quant_type == 'hadamard':
             (
                 ### buffered activation (attention) ###
-                x, 
+                x,
                 mean_1, rstd_1, # buffer for rmsnorm
                 x_norm_1, # x_norm_1
                 cos, sin, # buffer for rope
@@ -672,81 +711,116 @@ class FusedLlamaLayerFunc(torch.autograd.Function):
                 w_up, b_up, w_up_lora_a, w_up_lora_b,
                 w_down, b_down, w_down_lora_a, w_down_lora_b,
             ) = ctx.saved_tensors
-        
+        elif ctx.quant_type == 'nonlinear':
+            (
+                ### buffered activation (attention) ###
+                x_q, x_scale, # x
+                mean_1, rstd_1, # buffer for rmsnorm
+                x_norm_1, # x_norm_1
+                cos, sin, # buffer for rope
+                q_q, q_scale, # q
+                k_q, k_scale, # k
+                v_q, v_scale, # v
+                a_o, a_threshold, # a
+                o, # o
+                q_lora_a, k_lora_a, v_lora_a, # buffer for lora (qkv)
+                o_final_lora_a, # buffer for lora (o)
+                ### buffered activation (mlp) ###
+                mean_2, rstd_2, # buffer for rmsnorm
+                x_medium_q, x_medium_scale, # x_medium
+                x_norm_2, # x_norm_2
+                gate_q, gate_scale, # gate
+                up_q, up_scale, # up
+                fn_q, fn_scale, # fn
+                hadamard, # hadamard
+                gate_lora_a, up_lora_a, down_lora_a,
+                ### weights (attention) ###
+                norm_weight_1, norm_bias_1,
+                w_q, b_q, w_q_lora_a, w_q_lora_b,
+                w_k, b_k, w_k_lora_a, w_k_lora_b,
+                w_v, b_v, w_v_lora_a, w_v_lora_b,
+                w_o, b_o, w_o_lora_a, w_o_lora_b,
+                ### weights (mlp) ###
+                norm_weight_2, norm_bias_2,
+                w_gate, b_gate, w_gate_lora_a, w_gate_lora_b,
+                w_up, b_up, w_up_lora_a, w_up_lora_b,
+                w_down, b_down, w_down_lora_a, w_down_lora_b,
+            ) = ctx.saved_tensors
+
         #* dequantize hadamard
         if ctx.quant_type == 'linear':
             hadamard = decompression_dequantization(hadamard_q, hadamard_scale, ctx.q_bit)
             del hadamard_q, hadamard_scale
-        
+
         # down proj part
         grad_w_down_lora_a, grad_w_down_lora_b, grad_down = lora_backward(w_down, w_down_quant_state, w_down_lora_a, w_down_lora_b, hadamard, down_lora_a, grad_output)
         del hadamard
-        
+
         #* dequantize up
-        if ctx.quant_type == 'hadamard':
+        if ctx.quant_type == 'hadamard' or ctx.quant_type == 'nonlinear':
             up = decompression_dequantization(up_q, up_scale, ctx.q_bit)
             fn = decompression_dequantization(fn_q, fn_scale, ctx.q_bit)
             del up_q, up_scale, fn_q, fn_scale
-        
+
         # hadamard
         grad_hadamard_1 = grad_down * up
         grad_hadamard_2 = grad_down * fn
         del grad_down, up, fn
-        
+
         #* dequantize gate
-        if ctx.quant_type == 'silu':
+        if ctx.quant_type == 'silu' or ctx.quant_type == 'nonlinear':
             gate = decompression_dequantization(gate_q, gate_scale, ctx.q_bit)
             del gate_q, gate_scale
         grad_fn = silu_backward(gate, grad_hadamard_1)
         del gate, grad_hadamard_1
-        
+
         #* dequantize x_norm_2
         if ctx.quant_type == 'linear':
             x_norm_2 = decompression_dequantization(x_norm_2_q, x_norm_2_scale, ctx.q_bit)
             del x_norm_2_q, x_norm_2_scale
-        
+
         # gate proj part
         grad_w_gate_lora_a, grad_w_gate_lora_b, grad_gate = lora_backward(w_gate, w_gate_quant_state, w_gate_lora_a, w_gate_lora_b, x_norm_2, gate_lora_a, grad_fn)
         del grad_fn
-        
+
         # up proj part
         grad_w_up_lora_a, grad_w_up_lora_b, grad_up = lora_backward(w_up, w_up_quant_state, w_up_lora_a, w_up_lora_b, x_norm_2, up_lora_a, grad_hadamard_2)
         grad_gate_up = grad_up + grad_gate
         del grad_up, grad_gate, grad_hadamard_2
-        
+
         #* dequantize x_medium
-        if ctx.quant_type == 'layernorm':
+        if ctx.quant_type == 'layernorm' or ctx.quant_type == 'nonlinear':
             x_medium = decompression_dequantization(x_medium_q, x_medium_scale, ctx.q_bit)
             del x_medium_q, x_medium_scale
-        
+
         # layernorm & rmsnorm backward
         grad_norm_2, _ = rmsnorm_backward(
             grad_gate_up, x_medium, norm_weight_2, mean_2, rstd_2, # TODO: other params
             True, 1e-5, ctx.num_warps, ctx.block_size
         )
         del x_medium, grad_gate_up
-        
+
         # residual connection
         grad_medium = grad_norm_2 + grad_output
-        
+
         #* dequantize o
         if ctx.quant_type == 'linear':
             o = decompression_dequantization(o_q, o_scale, ctx.q_bit)
             del o_q, o_scale
-        
+
         # o part
         grad_w_o_lora_a, grad_w_o_lora_b, grad_o = lora_backward(w_o, w_o_quant_state, w_o_lora_a, w_o_lora_b, o, o_final_lora_a, grad_medium)
         del o
-        
+
         # reshape
         grad_o = hidden_to_head_shape(grad_o, ctx.num_heads)
-        
+
         #* dequantize a
         a = a_o.to_dense()
-        if ctx.quant_type == 'gemm':
+        if ctx.quant_type == 'gemm' or ctx.quant_type == 'nonlinear':
             v = decompression_dequantization(v_q, v_scale, ctx.q_bit, is_head=True, num_heads=ctx.num_heads)
             del a_o, v_q, v_scale
-        
+
         # backward of second GEMM: O = A @ V
         # d L / d V = A.T @ d L / d O
         grad_v = a.transpose(-2, -1) @ grad_o
@@ -759,9 +833,9 @@ class FusedLlamaLayerFunc(torch.autograd.Function):
 
         # backward of first GEMM: S = Q @ K.T / sqrt(d_k)
         grad_s = grad_s / math.sqrt(ctx.head_dim)
-        
+
         #* dequantize q
-        if ctx.quant_type == 'gemm':
+        if ctx.quant_type == 'gemm' or ctx.quant_type == 'nonlinear':
             q = decompression_dequantization(q_q, q_scale, ctx.q_bit, is_head=True, num_heads=ctx.num_heads)
             k = decompression_dequantization(k_q, k_scale, ctx.q_bit, is_head=True, num_heads=ctx.num_heads)
             del q_q, q_scale, k_q, k_scale
@@ -780,12 +854,12 @@ class FusedLlamaLayerFunc(torch.autograd.Function):
         grad_q = head_to_hidden_shape(grad_q)
         grad_k = head_to_hidden_shape(grad_k)
         grad_v = head_to_hidden_shape(grad_v)
-        
+
         #* dequantize x_norm_1
         if ctx.quant_type == 'linear':
             x_norm_1 = decompression_dequantization(x_norm_1_q, x_norm_1_scale, ctx.q_bit)
             del x_norm_1_q, x_norm_1_scale
-        
+
         # backward of q_proj
         grad_w_q_lora_a, grad_w_q_lora_b, grad_x = lora_backward(w_q, w_q_quant_state, w_q_lora_a, w_q_lora_b, x_norm_1, q_lora_a, grad_q)
 
@@ -796,21 +870,21 @@ class FusedLlamaLayerFunc(torch.autograd.Function):
         # backward of v_proj
         grad_w_v_lora_a, grad_w_v_lora_b, grad_x_temp = lora_backward(w_v, w_v_quant_state, w_v_lora_a, w_v_lora_b, x_norm_1, v_lora_a, grad_v)
         grad_x += grad_x_temp
-        
+
         #* dequantize x
-        if ctx.quant_type == 'layernorm':
+        if ctx.quant_type == 'layernorm' or ctx.quant_type == 'nonlinear':
             x = decompression_dequantization(x_q, x_scale, ctx.q_bit)
             del x_q, x_scale
-        
+
         # layernorm or rmsnorm backward
         grad_norm_1, _ = rmsnorm_backward(
             grad_x, x, norm_weight_1, mean_1, rstd_1, # TODO: other params
             True, 1e-5, ctx.num_warps, ctx.block_size
         )
-            
+
         # residual connection
         grad_input = grad_norm_1 + grad_medium
-        
+
         return (
             grad_input,
             #############attention part#############
@@ -880,7 +954,8 @@ class FusedLlamaLayer(torch.nn.Module):
         self.iteration_threshold = 5
         self.softmax_outlier_ratio = 0.05
         self.q_bit = 2
-        self.quant_type = 'layernorm' # ['layernorm', 'linear', 'gemm', 'silu', 'hadamard']
+        self.quant_type = 'nonlinear' # ['layernorm', 'linear', 'gemm', 'silu', 'hadamard']
+        print(f'use {self.quant_type}')
         if self.quant_type == 'layernorm':
             self.static_value = {
                 'x': {'scale': None},
@@ -893,24 +968,39 @@ class FusedLlamaLayer(torch.nn.Module):
                 'x_norm_2': {'scale': None},
                 'o': {'scale': None},
                 'hadamard': {'scale': None},
+                'a': {'outlier': None},
             }
         elif self.quant_type == 'gemm':
             self.static_value = {
                 'q': {'scale': None},
                 'k': {'scale': None},
                 'v': {'scale': None},
+                'a': {'outlier': None},
             }
         elif self.quant_type == 'silu':
             self.static_value = {
                 'gate': {'scale': None},
+                'a': {'outlier': None},
             }
         elif self.quant_type == 'hadamard':
             self.static_value = {
                 'up': {'scale': None},
                 'fn': {'scale': None},
+                'a': {'outlier': None},
             }
-                
-        
+        elif self.quant_type == 'nonlinear':
+            self.static_value = {
+                'x': {'scale': None},
+                'x_medium': {'scale': None},
+                'gate': {'scale': None},
+                'up': {'scale': None},
+                'fn': {'scale': None},
+                'q': {'scale': None},
+                'k': {'scale': None},
+                'v': {'scale': None},
+                'a': {'outlier': None},
+            }
+
     def forward(
         self,
         input: torch.Tensor,
@@ -1013,7 +1103,7 @@ class FusedLlamaLayer(torch.nn.Module):
             self.q_bit,
             self.quant_type,
         )
-        
+
         if self.iteration < self.iteration_threshold:
             if self.quant_type == 'layernorm':
                 y, x_scale, x_medium_scale, a_threshold = out
@@ -1037,9 +1127,18 @@ class FusedLlamaLayer(torch.nn.Module):
                 y, up_scale, fn_scale, a_threshold = out
                 self.static_value['up'] = update_dict(self.static_value['up'], {'scale': up_scale}, self.iteration)
                 self.static_value['fn'] = update_dict(self.static_value['fn'], {'scale': fn_scale}, self.iteration)
+            elif self.quant_type == 'nonlinear':
+                y, x_scale, x_medium_scale, q_scale, k_scale, v_scale, gate_scale, up_scale, fn_scale, a_threshold = out
+                self.static_value['x'] = update_dict(self.static_value['x'], {'scale': x_scale}, self.iteration)
+                self.static_value['x_medium'] = update_dict(self.static_value['x_medium'], {'scale': x_medium_scale}, self.iteration)
+                self.static_value['gate'] = update_dict(self.static_value['gate'], {'scale': gate_scale}, self.iteration)
+                self.static_value['up'] = update_dict(self.static_value['up'], {'scale': up_scale}, self.iteration)
+                self.static_value['fn'] = update_dict(self.static_value['fn'], {'scale': fn_scale}, self.iteration)
+                self.static_value['q'] = update_dict(self.static_value['q'], {'scale': q_scale}, self.iteration)
+                self.static_value['k'] = update_dict(self.static_value['k'], {'scale': k_scale}, self.iteration)
+                self.static_value['v'] = update_dict(self.static_value['v'], {'scale': v_scale}, self.iteration)
             self.static_value['a'] = update_dict(self.static_value['a'], {'outlier': a_threshold}, self.iteration)
-            
+
         self.iteration += 1
-        
+
         return out[0]
-        

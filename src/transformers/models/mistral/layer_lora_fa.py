@@ -57,7 +57,7 @@ def repeat_kv_backward(grad_output: torch.Tensor, n_rep: int):
     return grad_output.sum(dim=2)
 
 
-class FusedLlamaLayerFunc(torch.autograd.Function):
+class FusedMistralLayerFunc(torch.autograd.Function):
     @staticmethod
     def forward(
         ctx,
@@ -116,28 +116,26 @@ class FusedLlamaLayerFunc(torch.autograd.Function):
         ###############other################
         attention_mask: torch.Tensor,
         num_heads: int,
+        num_k_heads: int, # shrinked heads
         head_dim: int,
     ):
         # layernorm or rmsnorm
         x_norm_1, mean_1, rstd_1, _, _ = rmsnorm_forward(x, norm_weight_1, eps = 1e-5)
-        
-        #* compress the (copy of) x
-        x_copy = x.clone()
 
         # compute q,k,v
         # forward process: q_proj
-        q, q_main, q_lora_a = lora_forward(w_q, w_q_quant_state, w_q_lora_a, w_q_lora_b, b_q, x_norm_1)
+        q, _, q_lora_a = lora_forward(w_q, w_q_quant_state, w_q_lora_a, w_q_lora_b, b_q, x_norm_1)
 
         # forward process: k_proj
-        k, k_main, k_lora_a = lora_forward(w_k, w_k_quant_state, w_k_lora_a, w_k_lora_b, b_k, x_norm_1)
+        k, _, k_lora_a = lora_forward(w_k, w_k_quant_state, w_k_lora_a, w_k_lora_b, b_k, x_norm_1)
 
         # forward process: v_proj
-        v, v_main, v_lora_a = lora_forward(w_v, w_v_quant_state, w_v_lora_a, w_v_lora_b, b_v, x_norm_1)
+        v, _, v_lora_a = lora_forward(w_v, w_v_quant_state, w_v_lora_a, w_v_lora_b, b_v, x_norm_1)
         
         # reshape
         q = hidden_to_head_shape(q, num_heads)
-        k = hidden_to_head_shape(k, num_heads)
-        v = hidden_to_head_shape(v, num_heads)
+        k = hidden_to_head_shape(k, num_k_heads)
+        v = hidden_to_head_shape(v, num_k_heads)
         
         ctx.q_shape = q.shape
 
@@ -146,6 +144,7 @@ class FusedLlamaLayerFunc(torch.autograd.Function):
         k = rope_forward(k.transpose(1, 2), cos, sin).transpose(1, 2)
 
         # forward: S = Q @ K.T / sqrt(d_k)
+        k = repeat_kv(k, n_rep=num_heads // num_k_heads)
         s = q @ k.transpose(-2, -1) / math.sqrt(head_dim)
         
         # apply mask
@@ -156,13 +155,14 @@ class FusedLlamaLayerFunc(torch.autograd.Function):
         a = torch.softmax(s, dim=-1, dtype=v.dtype)  # [bsz, num_heads, q_len, q_len]
 
         # forward: O = A @ V
+        v = repeat_kv(v, n_rep=num_heads // num_k_heads)
         o = a @ v
         
         # reshape
         o = head_to_hidden_shape(o)
 
         # forward process: o_proj
-        o_final, o_final_main, o_final_lora_a = lora_forward(w_o, w_o_quant_state, w_o_lora_a, w_o_lora_b, b_o, o)
+        o_final, _, o_final_lora_a = lora_forward(w_o, w_o_quant_state, w_o_lora_a, w_o_lora_b, b_o, o)
         
         # residual connection
         x_medium = x + o_final
@@ -170,14 +170,11 @@ class FusedLlamaLayerFunc(torch.autograd.Function):
         # layernorm or rmsnorm
         x_norm_2, mean_2, rstd_2, block_size, num_warps = rmsnorm_forward(x_medium, norm_weight_2, eps = 1e-5)
         
-        #* compress the (copy of) x_medium
-        x_medium_copy = x_medium.clone()
-        
         # forward process: gate_proj
-        gate, gate_main, gate_lora_a = lora_forward(w_gate, w_gate_quant_state, w_gate_lora_a, w_gate_lora_b, b_gate, x_norm_2)
+        gate, _, gate_lora_a = lora_forward(w_gate, w_gate_quant_state, w_gate_lora_a, w_gate_lora_b, b_gate, x_norm_2)
         
         # forward process: up_proj
-        up, up_main, up_lora_a = lora_forward(w_up, w_up_quant_state, w_up_lora_a, w_up_lora_b, b_up, x_norm_2)
+        up, _, up_lora_a = lora_forward(w_up, w_up_quant_state, w_up_lora_a, w_up_lora_b, b_up, x_norm_2)
         
         # apply activation function (for gate)
         fn = torch.nn.functional.silu(gate)
@@ -186,7 +183,7 @@ class FusedLlamaLayerFunc(torch.autograd.Function):
         hadamard = up * fn
             
         # forward process: down_proj
-        down, down_main, down_lora_a = lora_forward(w_down, w_down_quant_state, w_down_lora_a, w_down_lora_b, b_down, hadamard)
+        down, _, down_lora_a = lora_forward(w_down, w_down_quant_state, w_down_lora_a, w_down_lora_b, b_down, hadamard)
         
         # residual connection
         x_out = x_medium + down
@@ -271,6 +268,7 @@ class FusedLlamaLayerFunc(torch.autograd.Function):
             w_down_quant_state,
         )
         ctx.num_heads = num_heads
+        ctx.num_k_heads = num_k_heads
         ctx.block_size = block_size
         ctx.num_warps = num_warps
         ctx.head_dim = head_dim
@@ -367,7 +365,6 @@ class FusedLlamaLayerFunc(torch.autograd.Function):
         grad_hadamard_1 = grad_down * up
         grad_hadamard_2 = grad_down * fn
         
-        # TODO: activation backward
         grad_fn = silu_backward(gate, grad_hadamard_1)
         
         # gate proj part
@@ -396,6 +393,7 @@ class FusedLlamaLayerFunc(torch.autograd.Function):
         # d L / d V = A.T @ d L / d O
         grad_v = a.transpose(-2, -1) @ grad_o
         grad_a = grad_o @ v.transpose(-2, -1)
+        grad_v = repeat_kv_backward(grad_v, n_rep=ctx.num_heads // ctx.num_k_heads)
 
         # backward of softmax
         grad_s = softmax_backward(a, grad_a)
@@ -404,6 +402,7 @@ class FusedLlamaLayerFunc(torch.autograd.Function):
         grad_s = grad_s / math.sqrt(ctx.head_dim)
         # d L / d K = (d L / d S)^T @ Q
         grad_k = grad_s.transpose(-2, -1) @ q
+        grad_k = repeat_kv_backward(grad_k, n_rep=ctx.num_heads // ctx.num_k_heads)
         # d L / d Q = d L / d S @ K
         grad_q = grad_s @ k
 
@@ -448,25 +447,25 @@ class FusedLlamaLayerFunc(torch.autograd.Function):
             None,
             None,
             None,
-            grad_w_q_lora_a,
+            None,
             grad_w_q_lora_b,
             ####################################
             None,
             None,
             None,
-            grad_w_k_lora_a,
+            None,
             grad_w_k_lora_b,
             ####################################
             None,
             None,
             None,
-            grad_w_v_lora_a,
+            None,
             grad_w_v_lora_b,
             ####################################
             None,
             None,
             None,
-            grad_w_o_lora_a,
+            None,
             grad_w_o_lora_b,
             ####################################
             None,
@@ -475,32 +474,34 @@ class FusedLlamaLayerFunc(torch.autograd.Function):
             None,
             None,
             None,
-            grad_w_gate_lora_a,
+            None,
             grad_w_gate_lora_b,
             ####################################
             None,
             None,
             None,
-            grad_w_up_lora_a,
+            None,
             grad_w_up_lora_b,
             ####################################
             None,
             None,
             None,
-            grad_w_down_lora_a,
+            None,
             grad_w_down_lora_b
-        ) + (None,) * 3
+        ) + (None,) * 4
 
 
-class FusedLlamaLayer(torch.nn.Module):
+class FusedMistralLayer(torch.nn.Module):
     def __init__(
         self,
         hidden_dim: int,
         num_heads: int,
+        num_k_heads: int,
     ):
-        super(FusedLlamaLayer, self).__init__()
+        super(FusedMistralLayer, self).__init__()
         self.hidden_dim = hidden_dim
         self.num_heads = num_heads
+        self.num_k_heads = num_k_heads
         self.iteration = 0
         self.static_value = None
         
@@ -539,10 +540,11 @@ class FusedLlamaLayer(torch.nn.Module):
         ############################################
         attention_mask: torch.Tensor,
         num_heads: int,
+        num_k_heads: int,
         head_dim: int,
-        lora_alpha: float
+        lora_alpha: int
     ):
-        y = FusedLlamaLayerFunc.apply(
+        y = FusedMistralLayerFunc.apply(
             input,
             #############attention part#############
             norm_weight_1,
@@ -598,6 +600,7 @@ class FusedLlamaLayer(torch.nn.Module):
             ####################################
             attention_mask,
             num_heads,
+            num_k_heads,
             head_dim,
         )
         

@@ -45,6 +45,8 @@ from ...utils import (
 from ...utils.import_utils import is_torch_fx_available
 from .configuration_gemma import GemmaConfig
 
+from .layer_replace_order import FusedGemmaLayer
+
 
 if is_flash_attn_2_available():
     from flash_attn import flash_attn_func, flash_attn_varlen_func
@@ -622,14 +624,75 @@ class GemmaDecoderLayer(nn.Module):
     def __init__(self, config: GemmaConfig, layer_idx: int):
         super().__init__()
         self.hidden_size = config.hidden_size
-
+        self.num_attention_heads = config.num_attention_heads
+        self.num_key_heads = config.num_key_value_heads
         self.self_attn = GEMMA_ATTENTION_CLASSES[config._attn_implementation](config=config, layer_idx=layer_idx)
 
         self.mlp = GemmaMLP(config)
         self.input_layernorm = GemmaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.post_attention_layernorm = GemmaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        
+        self.fused_mistral_layer = FusedGemmaLayer(config.hidden_size, config.num_attention_heads, config.num_key_value_heads)
+
 
     def forward(
+        self,
+        hidden_states: torch.Tensor,
+        attention_mask: Optional[torch.Tensor] = None,
+        position_ids: Optional[torch.LongTensor] = None,
+        past_key_value: Optional[Cache] = None,
+        output_attentions: Optional[bool] = False,
+        use_cache: Optional[bool] = False,
+        cache_position: Optional[torch.LongTensor] = None,
+        **kwargs,
+    ) -> Tuple[torch.FloatTensor, Optional[Tuple[torch.FloatTensor, torch.FloatTensor]]]:
+        if self.training:
+            batch, seq_len, _ = hidden_states.shape
+            hidden_states_fake = hidden_states.view(batch, self.num_attention_heads, seq_len, self.hidden_size // self.num_attention_heads)
+            cos, sin = self.self_attn.rotary_emb.forward(hidden_states_fake, position_ids)
+            del hidden_states_fake
+            
+            outputs = self.fused_mistral_layer.forward(
+                hidden_states,
+                self.input_layernorm.weight,
+                None,
+                cos,
+                sin,
+                self.self_attn.q_proj.base_layer,
+                self.self_attn.q_proj.lora_A,
+                self.self_attn.q_proj.lora_B,
+                self.self_attn.k_proj.base_layer,
+                self.self_attn.k_proj.lora_A,
+                self.self_attn.k_proj.lora_B,
+                self.self_attn.v_proj.base_layer,
+                self.self_attn.v_proj.lora_A,
+                self.self_attn.v_proj.lora_B,
+                self.self_attn.o_proj.base_layer,
+                self.self_attn.o_proj.lora_A,
+                self.self_attn.o_proj.lora_B,
+                self.post_attention_layernorm.weight,
+                None,
+                self.mlp.gate_proj.base_layer,
+                self.mlp.gate_proj.lora_A,
+                self.mlp.gate_proj.lora_B,
+                self.mlp.up_proj.base_layer,
+                self.mlp.up_proj.lora_A,
+                self.mlp.up_proj.lora_B,
+                self.mlp.down_proj.base_layer,
+                self.mlp.down_proj.lora_A,
+                self.mlp.down_proj.lora_B,
+                attention_mask,
+                self.num_attention_heads,
+                self.num_key_heads,
+                self.hidden_size // self.num_attention_heads,
+                self.self_attn.q_proj.scaling['default']
+            )
+            return (outputs,)
+        
+        else:
+            return self.forward_old(hidden_states, attention_mask, position_ids, past_key_value, output_attentions, use_cache, cache_position, **kwargs)
+
+    def forward_old(
         self,
         hidden_states: torch.Tensor,
         attention_mask: Optional[torch.Tensor] = None,
@@ -865,6 +928,7 @@ class GemmaModel(GemmaPreTrainedModel):
             output_hidden_states if output_hidden_states is not None else self.config.output_hidden_states
         )
         use_cache = use_cache if use_cache is not None else self.config.use_cache
+        use_cache = False if self.training else use_cache
         return_dict = return_dict if return_dict is not None else self.config.use_return_dict
 
         if (input_ids is None) ^ (inputs_embeds is not None):
